@@ -1,0 +1,2717 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>伝説の唐揚げダンジョン</title>
+<style>
+  html,body{margin:0;padding:0;background:#050508;height:100%;overflow:hidden;user-select:none;}
+  body{font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  #cv{image-rendering:pixelated;box-shadow:0 0 60px rgba(255,170,40,.15);border:1px solid #2a2417;background:#000;touch-action:none;}
+  #vig{position:fixed;inset:0;pointer-events:none;box-shadow:inset 0 0 180px rgba(0,0,0,.75);}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv" width="960" height="540"></canvas></div>
+<div id="vig"></div>
+<script>
+"use strict";
+/* ============================================================
+   伝説の唐揚げダンジョン
+   ロウライク・アクションRPG / 上視点 / 1〜100階
+   コードは本ファイル1つ。画像=assets/ 音声=audio/ (MCP生成)
+   ============================================================ */
+
+// ---------- 基本 ----------
+const W=960,H=540,TILE=32,MW=40,MH=30;
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+ctx.imageSmoothingEnabled=false;
+function fitCanvas(){
+  const s=Math.min(innerWidth/W,innerHeight/H)*0.98;
+  cv.style.width=(W*s)+"px";cv.style.height=(H*s)+"px";
+}
+addEventListener("resize",fitCanvas);fitCanvas();
+
+// ---------- 乱数(シード付き) ----------
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+let RUN_SEED=(Math.random()*1e9|0);
+
+// ---------- 画像 / 音声 ロード(欠落時は代替描画) ----------
+const IMG={},AUD={};
+const IMG_LIST=[
+ "bg_title.png","bg_town.png","bg_clear.png",
+ "hero.png","paladin.png","mage.png","summoner.png","unjob.png",
+ "slime.png","bat.png","skeleton.png","ghost.png","golem.png","imp.png",
+ "fire_imp.png","lava_golem.png","toad.png","snake.png","ice_wraith.png","frost_wolf.png",
+ "shadow.png","eye.png","death_knight.png","reaper.png","fallen.png","archer.png",
+  "demon_guard.png","demon.png","boss_karaage.png",
+  "summon_ken.png","summon_ryu.png","summon_kame.png","summon_hotori.png","summon_kitsune.png",
+  "hero_walk.png","paladin_walk.png","mage_walk.png","summoner_walk.png","unjob_walk.png",
+  "slime_walk.png","bat_walk.png","skeleton_walk.png","ghost_walk.png","golem_walk.png","imp_walk.png",
+  "fire_imp_walk.png","lava_golem_walk.png","toad_walk.png","snake_walk.png","ice_wraith_walk.png","frost_wolf_walk.png",
+  "shadow_walk.png","eye_walk.png","death_knight_walk.png","reaper_walk.png","fallen_walk.png","archer_walk.png",
+  "demon_guard_walk.png","demon_walk.png","boss_karaage_walk.png",
+  "summon_ken_walk.png","summon_ryu_walk.png","summon_kame_walk.png","summon_hotori_walk.png","summon_kitsune_walk.png",
+ "tile_floor.png","tile_floor_bone.png","tile_floor_fire.png","tile_floor_poison.png","tile_floor_ice.png","tile_floor_dark.png",
+ "tile_wall.png","stairs.png","gate.png","savepoint.png","chest.png",
+ "icon_gold.png","icon_hp.png","icon_mp.png","icon_exp.png","icon_karaage.png",
+ "icon_sword.png","icon_blade.png","icon_axe.png","icon_spear.png","icon_bow.png",
+ "icon_orb.png","icon_staff.png","icon_scythe.png","icon_fang.png","icon_holy.png",
+ "icon_leather.png","icon_mail.png","icon_plate.png","icon_shieldmail.png","icon_crown.png",
+ "icon_ring_atk.png","icon_ring_mag.png","icon_ring_def.png","icon_ring_spd.png",
+ "icon_potion_s.png","icon_potion_l.png","icon_ethers.png","icon_summonmat.png",
+ "ui_panel.png","ui_button.png","ui_bar.png"
+];
+IMG_LIST.forEach(n=>{
+  const im=new Image();
+  im.onload=function(){im._ok=true;};
+  im.src="assets/"+n;
+  IMG[n]=im;
+});
+const AUD_LIST=[
+ "bgm_title.ogg","bgm_town.ogg","bgm_dungeon.ogg","bgm_boss.ogg","bgm_clear.ogg",
+ "sfx_swing.ogg","sfx_hit.ogg","sfx_ehit.ogg","sfx_pickup.ogg","sfx_stairs.ogg","sfx_warp.ogg",
+ "sfx_levelup.ogg","sfx_skill.ogg","sfx_guard.ogg","sfx_potion.ogg","sfx_shop.ogg",
+ "sfx_death.ogg","sfx_boss.ogg","sfx_victory.ogg","sfx_summon.ogg","sfx_click.ogg",
+ "voice_shop.ogg","voice_boss_in.ogg","voice_boss_die.ogg","voice_clear.ogg"
+];
+AUD_LIST.forEach(n=>{
+  try{const a=new Audio("audio/"+n);a.preload="auto";AUD[n]=a;}catch(e){}
+});
+
+// ---------- 再生ヘルパ ----------
+let bgmNow=null,bgmLoop=false;
+function playBGM(n,loop){
+  if(loop===undefined)loop=true;
+  const a=AUD[n];
+  if(!a||!a.src)return;
+  if(bgmNow&&bgmNow!==a){try{bgmNow.pause();}catch(e){}}
+  bgmNow=a;bgmLoop=loop;
+  try{a.currentTime=0;a.playbackRate=1;}catch(e){}
+  const p=a.play();
+  if(p&&p.then)p.then(function(){if(bgmLoop)a.loop=true;}).catch(function(){});
+  if(bgmLoop)a.loop=true;
+}
+function stopBGM(){if(bgmNow){try{bgmNow.pause();}catch(e){}bgmNow=null;}}
+// SFXプール: 同時に最大5本まで重ね再生(ターン制では連打が多い)
+function playSFX(n,rate){
+  const base=AUD[n];if(!base||!base.src)return;
+  const pool=base._pool||(base._pool=[]);
+  let a=pool[base._pi||0];
+  base._pi=((base._pi||0)+1)%5;
+  if(!a){
+    try{a=new Audio(base.src);pool.push(a);}catch(e){return;}
+  }
+  try{a.currentTime=0;a.playbackRate=rate||1;a.play().catch(function(){});}catch(e){}
+}
+function playVoice(n){const a=AUD[n];if(!a||!a.src)return;try{a.currentTime=0;a.play().catch(function(){});}catch(e){}}
+
+// ---------- 入力 ----------
+const K={},KPHYS={};
+// 仮想キー(モバイルタッチ): K = 物理(KPHYS) OR 仮想(VK) として統合
+const VK={w:0,a:0,s:0,d:0,z:0,x:0,c:0,v:0,up:0,down:0,left:0,right:0};
+const VKCODE={w:"KeyW",a:"KeyA",s:"KeyS",d:"KeyD",z:"KeyZ",x:"KeyX",c:"KeyC",v:"KeyV",up:"ArrowUp",down:"ArrowDown",left:"ArrowLeft",right:"ArrowRight"};
+const VKREV={};
+for(const k in VKCODE)VKREV[VKCODE[k]]=k;
+function mergeVK(){
+  for(const k in VKCODE)K[VKCODE[k]]=!!(KPHYS[VKCODE[k]]||VK[k]);
+}
+addEventListener("keydown",function(e){
+  KPHYS[e.code]=true;
+  mergeVK();
+  if(["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].indexOf(e.code)>=0)e.preventDefault();
+  if(e.code==="Tab"||e.code==="KeyI"){
+    e.preventDefault();
+    if(G.screen==="dungeon"||G.screen==="town")toggleBag();
+    return;
+  }
+  if(e.code==="KeyP"||e.code==="Escape"){
+    if(UI.bag){closeBag();return;}
+    UI.togglePause();
+  }
+});
+addEventListener("keyup",function(e){
+  KPHYS[e.code]=false;
+  mergeVK();
+});
+const KPREV={};
+function key(){
+  for(let i=0;i<arguments.length;i++)if(K[arguments[i]])return true;
+  return false;
+}
+function keyP(){
+  for(let i=0;i<arguments.length;i++)if(K[arguments[i]]&&!KPREV[arguments[i]])return true;
+  return false;
+}
+function syncKeys(){
+  for(const c in K)KPREV[c]=K[c];
+  for(const c in KPREV)if(!K[c])KPREV[c]=false;
+}
+let FRAME_DT=1/60;
+const REPST={};
+function keyR(){
+  for(let i=0;i<arguments.length;i++){
+    const c=arguments[i];
+    if(!K[c]){REPST[c]=0;continue;}
+    if(!KPREV[c]){REPST[c]=0;return true;}
+    let r=REPST[c];
+    r+=FRAME_DT;
+    if(r<0.4){REPST[c]=r;continue;}
+    r-=0.4;
+    if(r>=0.12){REPST[c]=r-0.12;return true;}
+    REPST[c]=r;
+  }
+  return false;
+}
+
+// ---------- 定義: ジョブ ----------
+// ---------- 定義: ジョブ (ターン制: cdはターン数) ----------
+const DIRS=[[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1],[0,-1],[1,-1]];
+const DIR_NAMES=["→","↘","↓","↙","←","↖","↑","↗"];
+const JOBS={
+  hero:{name:"勇者",desc:"攻守均衡の王道の戦士。武器を使うほどその武器が覚醒する。",
+    base:{hp:120,mp:30,atk:14,mag:6,def:10,spd:4},
+    grow:{hp:14,mp:4,atk:3,mag:1,def:2,spd:0.8},
+    skills:[
+      {name:"溜め斬り",cd:4,mp:8,desc:"向いている敵を2.2倍斬撃"},
+      {name:"突進",cd:5,mp:10,desc:"向いている方向に最大3マス移動"},
+      {name:"回復の光",cd:8,mp:20,desc:"HPを35%回復"}
+    ]},
+  paladin:{name:"聖騎士",desc:"盾で受け流す重装の聖戦士。防御が聖光の力になる。",
+    base:{hp:150,mp:40,atk:11,mag:10,def:15,spd:3.4},
+    grow:{hp:17,mp:5,atk:2,mag:2,def:3,spd:0.6},
+    skills:[
+      {name:"聖光斬",cd:4,mp:14,desc:"周囲1マスの敵に聖属性斬撃"},
+      {name:"神聖の盾",cd:6,mp:16,desc:"次の敵ターンまでダメージ75%カット"},
+      {name:"光の反撃",cd:8,mp:22,desc:"周囲2マス以内の敵に光の爆発"}
+    ]},
+  mage:{name:"賢者",desc:"魔術で戦う文士。魔法を撃つほど魔術書が完成し魔力が上がる。",
+    base:{hp:90,mp:80,atk:6,mag:16,def:7,spd:4},
+    grow:{hp:10,mp:9,atk:1,mag:3.4,def:1.6,spd:0.8},
+    skills:[
+      {name:"火球術",cd:2,mp:12,desc:"向いている直線6マスに火球"},
+      {name:"氷結術",cd:6,mp:18,desc:"周囲1マスの敵を凍結+ダメージ"},
+      {name:"雷撃",cd:7,mp:26,desc:"最も近い敵を落雷で撃つ"}
+    ]},
+  summoner:{name:"召喚士",desc:"召喚獣を従える魔導士。獣を育てれば育てるほど最強になる。",
+    base:{hp:100,mp:90,atk:7,mag:13,def:8,spd:4},
+    grow:{hp:11,mp:10,atk:1.4,mag:3,def:1.8,spd:0.8},
+    skills:[
+      {name:"召喚",cd:3,mp:25,desc:"召喚獣を呼び出す(獣は毎ターン自動戦闘)"},
+      {name:"獣の加護",cd:8,mp:20,desc:"獣を全治癒し3ターン強化"},
+      {name:"後退",cd:1,mp:0,desc:"召喚獣を収める(消費しない)"}
+    ]},
+  unjob:{name:"無職",desc:"何の肩書もない男。初期はゼロだが、誰よりも早く何にでもなれる。",
+    base:{hp:80,mp:40,atk:8,mag:8,def:6,spd:5},
+    grow:{hp:13,mp:6,atk:3.6,mag:3.4,def:2.4,spd:1.0},
+    skills:[
+      {name:"万能器用",cd:3,mp:10,desc:"周囲1マスの敵に複合攻撃(攻+魔で威力)"},
+      {name:"無双乱舞",cd:6,mp:20,desc:"次の2ターン、移動が1行動で2マスに"},
+      {name:"逆境の力",cd:9,mp:15,desc:"HPが低いほど強力な周囲2マス爆発"}
+    ]}
+};
+
+// ---------- 定義: 敵20種 + ボス ----------
+// kind: chase / shoot / charge / flying / boss
+const ENEMIES=[
+ {id:"slime",name:"スライム",theme:0,kind:"chase",hp:26,atk:7,def:2,spd:1.6,xp:8,gold:[3,8],r:13,col:"#4fd25a",size:128},
+ {id:"bat",name:"洞窟の蝙蝠",theme:0,kind:"flying",hp:20,atk:8,def:1,spd:3.4,xp:9,gold:[3,9],r:11,col:"#8a5fc9",size:128},
+ {id:"skeleton",name:"骨戦士",theme:1,kind:"chase",hp:48,atk:12,def:5,spd:2.0,xp:14,gold:[6,14],r:14,col:"#d8d4c8",size:128},
+ {id:"ghost",name:"怨霊",theme:1,kind:"flying",hp:40,atk:14,def:3,spd:2.6,xp:16,gold:[8,16],r:13,col:"#9fd8ff",size:128},
+ {id:"golem",name:"岩ゴレム",theme:2,kind:"chase",hp:110,atk:18,def:12,spd:1.1,xp:26,gold:[14,26],r:18,col:"#8f8f96",size:128},
+ {id:"imp",name:"インプ",theme:2,kind:"shoot",hp:34,atk:11,def:4,spd:2.4,xp:18,gold:[10,18],r:12,col:"#c0392b",size:128},
+ {id:"fire_imp",name:"炎インプ",theme:3,kind:"shoot",hp:52,atk:16,def:5,spd:2.8,xp:26,gold:[16,28],r:12,col:"#ff7b2e",size:128},
+ {id:"lava_golem",name:"溶岩ゴレム",theme:3,kind:"charge",hp:180,atk:24,def:14,spd:1.2,xp:40,gold:[24,40],r:18,col:"#e2571c",size:128},
+ {id:"toad",name:"毒ガエル",theme:4,kind:"charge",hp:70,atk:18,def:8,spd:2.2,xp:30,gold:[20,34],r:15,col:"#7ec850",size:128},
+ {id:"snake",name:"毒蛇",theme:4,kind:"chase",hp:60,atk:22,def:7,spd:3.0,xp:32,gold:[22,36],r:13,col:"#4a7a3a",size:128},
+ {id:"ice_wraith",name:"氷の幽霊",theme:5,kind:"shoot",hp:80,atk:24,def:9,spd:2.4,xp:42,gold:[28,44],r:14,col:"#bfe8ff",size:128},
+ {id:"frost_wolf",name:"氷霜の狼",theme:5,kind:"charge",hp:95,atk:28,def:10,spd:3.2,xp:46,gold:[32,48],r:15,col:"#dceef8",size:128},
+ {id:"shadow",name:"影兵",theme:6,kind:"chase",hp:110,atk:32,def:13,spd:3.0,xp:56,gold:[40,58],r:14,col:"#3d2f52",size:128},
+ {id:"eye",name:"魔眼",theme:6,kind:"shoot",hp:70,atk:30,def:8,spd:1.8,xp:52,gold:[38,54],r:13,col:"#c33bd4",size:128},
+ {id:"death_knight",name:"死神騎士",theme:7,kind:"charge",hp:200,atk:40,def:20,spd:2.2,xp:80,gold:[56,80],r:17,col:"#26242e",size:128},
+ {id:"reaper",name:"死神",theme:7,kind:"shoot",hp:130,atk:38,def:14,spd:2.4,xp:74,gold:[52,76],r:15,col:"#5a5a66",size:128},
+ {id:"fallen",name:"堕天の天使",theme:8,kind:"flying",hp:160,atk:44,def:18,spd:3.0,xp:96,gold:[68,96],r:16,col:"#e8e2d0",size:128},
+ {id:"archer",name:"聖骸の弓手",theme:8,kind:"shoot",hp:110,atk:48,def:14,spd:2.6,xp:90,gold:[64,90],r:14,col:"#cfc4a8",size:128},
+ {id:"demon_guard",name:"魔王衛兵",theme:9,kind:"chase",hp:260,atk:52,def:26,spd:2.4,xp:120,gold:[86,120],r:17,col:"#7a1f2b",size:128},
+ {id:"demon",name:"魔族将軍",theme:9,kind:"shoot",hp:200,atk:58,def:22,spd:2.6,xp:130,gold:[96,130],r:16,col:"#4a1030",size:128},
+ {id:"boss_karaage",name:"唐揚げ魔王",theme:10,kind:"boss",hp:3200,atk:66,def:30,spd:2.6,xp:999,gold:[500,800],r:30,col:"#e8942e",size:192}
+];
+const EBY={};ENEMIES.forEach(function(e){EBY[e.id]=e;});
+
+// ---------- 定義: 召喚獣5種 ----------
+const SUMMONS=[
+ {id:"summon_ken",name:"戦鶏 ケン",img:"summon_ken.png",col:"#e8c25a",ai:"melee",desc:"先鋭の鶏武者。近接で追撃する。"},
+ {id:"summon_ryu",name:"炎竜 リュウ",img:"summon_ryu.png",col:"#ff6b2e",ai:"shoot",desc:"火球を吐く古竜。遠距離で火力支援。"},
+ {id:"summon_kame",name:"鉄亀 カメ",img:"summon_kame.png",col:"#5a9e6b",ai:"wall",desc:"鉄の甲羅で盾になり、接近した敵を弾き返す。"},
+ {id:"summon_hotori",name:"雷鳥 ホトリ",img:"summon_hotori.png",col:"#7ec8ff",ai:"dash",desc:"雷を纏い高速で敵を蹴散らす。"},
+ {id:"summon_kitsune",name:"影狐 キツネ",img:"summon_kitsune.png",col:"#9a6bd4",ai:"stalk",desc:"影を忍び歩き、元気を残す敵を狙い撃つ。"}
+];
+const SUMMON_BY={};SUMMONS.forEach(function(s){SUMMON_BY[s.id]=s;});
+const SUM_STAGE={hp:[1,1.35,1.8,2.4,3.1,4,5.1,6.5,8.2,10.5],atk:[1,1.4,1.9,2.5,3.2,4.1,5.2,6.6,8.4,10.6]};
+
+// ---------- 定義: アイテム ----------
+const WEAPONS=[
+ {id:"w_sword",name:"鋼の剣",img:"icon_sword.png",atk:6,mag:0,tier:1,price:150},
+ {id:"w_blade",name:"大剣",img:"icon_blade.png",atk:11,mag:0,tier:2,price:420},
+ {id:"w_axe",name:"戦斧",img:"icon_axe.png",atk:16,mag:0,tier:3,price:900},
+ {id:"w_spear",name:"槍",img:"icon_spear.png",atk:12,mag:2,tier:2,price:460},
+ {id:"w_bow",name:"狩猟の弓",img:"icon_bow.png",atk:9,mag:4,tier:2,price:440},
+ {id:"w_orb",name:"魔導玉",img:"icon_orb.png",atk:0,mag:14,tier:2,price:520},
+ {id:"w_staff",name:"賢者の杖",img:"icon_staff.png",atk:0,mag:20,tier:3,price:1100},
+ {id:"w_scythe",name:"死神の鎌",img:"icon_scythe.png",atk:24,mag:8,tier:4,price:2200},
+ {id:"w_fang",name:"竜牙",img:"icon_fang.png",atk:30,mag:14,tier:5,price:4200},
+ {id:"w_holy",name:"伝説の唐揚げ包丁",img:"icon_holy.png",atk:40,mag:20,tier:6,price:8000,legend:true}
+];
+const ARMORS=[
+ {id:"a_leather",name:"革の鎧",img:"icon_leather.png",def:4,tier:1,price:120},
+ {id:"a_mail",name:"鎖帷子",img:"icon_mail.png",def:9,tier:2,price:380},
+ {id:"a_plate",name:"鋼の板鎧",img:"icon_plate.png",def:16,tier:3,price:850},
+ {id:"a_shieldmail",name:"盾鎧",img:"icon_shieldmail.png",def:24,tier:4,price:1800},
+ {id:"a_crown",name:"伝説の唐揚げの羽織",img:"icon_crown.png",def:34,tier:5,price:4500,legend:true}
+];
+const RINGS=[
+ {id:"r_atk",name:"攻の指輪",img:"icon_ring_atk.png",atk:6,price:500},
+ {id:"r_mag",name:"魔の指輪",img:"icon_ring_mag.png",mag:6,price:500},
+ {id:"r_def",name:"守の指輪",img:"icon_ring_def.png",def:6,price:450},
+ {id:"r_spd",name:"速の指輪",img:"icon_ring_spd.png",spd:1.2,price:550}
+];
+const CONSUMABLES=[
+ {id:"p_hp_s",name:"HPの薬(小)",img:"icon_potion_s.png",hp:60,price:60},
+ {id:"p_hp_l",name:"HPの薬(大)",img:"icon_potion_l.png",hp:200,price:180},
+ {id:"p_mp",name:"エーテル",img:"icon_ethers.png",mp:80,price:90},
+ {id:"s_mat",name:"獣の鱗",img:"icon_summonmat.png",summon:1,price:400,desc:"召喚獣強化に使う"}
+];
+const ALL_ITEMS={};
+[...WEAPONS,...ARMORS,...RINGS,...CONSUMABLES].forEach(function(it){ALL_ITEMS[it.id]=it;});
+
+// ---------- 定義: 階層テーマ(10) ----------
+const THEMES=[
+ {name:"地下回廊",floor:"tile_floor.png",wall:"#3a3630",enemies:["slime","bat"],tint:"#2a2622"},
+ {name:"骨の地下墓",floor:"tile_floor_bone.png",wall:"#4a463e",enemies:["skeleton","ghost"],tint:"#33302a"},
+ {name:"ゴレムの石殿",floor:"tile_floor.png",wall:"#4a4a52",enemies:["golem","imp"],tint:"#2e2e34"},
+ {name:"溶岩洞窟",floor:"tile_floor_fire.png",wall:"#4a2a1c",enemies:["fire_imp","lava_golem"],tint:"#33201a"},
+ {name:"毒沼の底",floor:"tile_floor_poison.png",wall:"#2e4a2a",enemies:["toad","snake"],tint:"#1e3320"},
+ {name:"氷の聖堂",floor:"tile_floor_ice.png",wall:"#2a4a5a",enemies:["ice_wraith","frost_wolf"],tint:"#1e3340"},
+ {name:"暗黒の深淵",floor:"tile_floor_dark.png",wall:"#241a33",enemies:["shadow","eye"],tint:"#181022"},
+ {name:"亡霊王の城塞",floor:"tile_floor_bone.png",wall:"#2e2a38",enemies:["death_knight","reaper"],tint:"#221e2c"},
+ {name:"天使の遺跡",floor:"tile_floor_ice.png",wall:"#5a5a6a",enemies:["fallen","archer"],tint:"#3a3a4a"},
+ {name:"魔王の巣窟",floor:"tile_floor_fire.png",wall:"#331018",enemies:["demon_guard","demon"],tint:"#260c12"}
+];
+function themeOf(f){return THEMES[Math.min(9,Math.floor((f-1)/10))];}
+
+// ============================================================
+// セーブデータ
+// ============================================================
+let SAVE=null;
+function newSave(jobId){
+  const j=JOBS[jobId];
+  return {
+    job:jobId,lv:1,xp:0,gold:300,
+    hp:j.base.hp,mp:j.base.mp,
+    stats:Object.assign({},j.base),
+    equip:{weapon:null,armor:null,ring:null},
+    inv:[{id:"p_hp_s",n:3},{id:"p_mp",n:1}],
+    mastery:{},
+    magicXp:0,
+    summons:{},
+    bossDown:false,
+    floorsVisited:{},
+    maxFloor:1,
+    cleared:false,
+    savedAt:null
+  };
+}
+function loadSave(){try{const s=localStorage.getItem("karaage_dungeon_save");if(s)return JSON.parse(s);}catch(e){}return null;}
+function storeSave(){try{localStorage.setItem("karaage_dungeon_save",JSON.stringify(SAVE));SAVE.savedAt=Date.now();}catch(e){}}
+function clearSave(){try{localStorage.removeItem("karaage_dungeon_save");}catch(e){}}
+
+// 派生ステータス
+function dStats(){
+  const s=SAVE,base=s.stats;
+  let atk=base.atk,mag=base.mag,def=base.def,spd=base.spd;
+  const w=s.equip.weapon&&ALL_ITEMS[s.equip.weapon];
+  if(w){atk+=w.atk;mag+=w.mag||0;}
+  const a=s.equip.armor&&ALL_ITEMS[s.equip.armor];
+  if(a)def+=a.def;
+  const r=s.equip.ring&&ALL_ITEMS[s.equip.ring];
+  if(r){atk+=r.atk||0;mag+=r.mag||0;def+=r.def||0;spd+=r.spd||0;}
+  if(s.job==="hero"&&w){const m=s.mastery[w.id]||0;atk+=m*1.5;mag+=m;}
+  if(s.job==="mage"){mag+=Math.min(10,s.magicXp)*1.2;}
+  if(s.job==="unjob"){atk+=s.lv*0.4;mag+=s.lv*0.4;}
+  return {atk:atk,mag:mag,def:def,spd:spd,hpMax:base.hp,mpMax:base.mp};
+}
+function xpNeed(lv){return Math.floor(60*Math.pow(lv,1.35));}
+function gainXp(n){
+  SAVE.xp+=n;
+  let lv=SAVE.lv,changed=false;
+  while(SAVE.xp>=xpNeed(lv)){
+    SAVE.xp-=xpNeed(lv);lv++;changed=true;
+    const g=JOBS[SAVE.job].grow;
+    SAVE.stats.hp+=g.hp;SAVE.stats.mp+=g.mp;
+    SAVE.stats.atk+=g.atk;SAVE.stats.mag+=g.mag;
+    SAVE.stats.def+=g.def;SAVE.stats.spd+=g.spd;
+  }
+  if(changed){
+    SAVE.lv=lv;
+    const d=dStats();
+    SAVE.hp=Math.min(d.hpMax,SAVE.hp+d.hpMax*0.4);
+    playSFX("sfx_levelup.ogg");
+    UI.toast("レベルアップ! Lv."+lv);
+    UI.flashLv=1;
+  }
+}
+function addItem(id,n){
+  if(n===undefined)n=1;
+  const ex=SAVE.inv.find(function(i){return i.id===id;});
+  if(ex)ex.n+=n;else SAVE.inv.push({id:id,n:n});
+  const it=ALL_ITEMS[id];
+  if(it)UI.toast(it.name+" を入手");
+}
+
+// ============================================================
+// マップ生成 (破綻ゼロ保証: MST接続+BFS検証+フォールバック)
+// ============================================================
+const WALL=0,FLOOR=1;
+const MAP={grid:null,floor:1,seed:0,rooms:[],entry:null,exit:null,gate:null,savept:null,theme:null};
+function genMap(floor,seed){
+  const rng=mulberry32(((seed*7349+floor*104729)|0)>>>0);
+  for(let att=0;att<10;att++){
+    const g=genAttempt(floor,rng);
+    if(g&&validateMap(g)){
+      MAP.grid=g.grid;MAP.rooms=g.rooms;MAP.entry=g.entry;MAP.exit=g.exit;
+      MAP.gate=(floor%10===0)?g.gate:null;
+      MAP.savept=(floor%10===0)?g.savept:null;
+      MAP.floor=floor;MAP.seed=seed;MAP.theme=themeOf(floor);
+      return;
+    }
+  }
+  const g=fallbackMap();
+  MAP.grid=g.grid;MAP.rooms=g.rooms;MAP.entry=g.entry;MAP.exit=g.exit;
+  MAP.gate=(floor%10===0)?{x:g.exit.x-1,y:g.exit.y}:null;
+  MAP.savept=(floor%10===0)?{x:g.exit.x+1,y:g.exit.y}:null;
+  MAP.floor=floor;MAP.seed=seed;MAP.theme=themeOf(floor);
+}
+function genAttempt(floor,rng){
+  const grid=Array.from({length:MH},function(){return new Array(MW).fill(WALL);});
+  const rooms=[];
+  const NR=Math.min(14,8+Math.floor(floor/12));
+  let guard=0;
+  while(rooms.length<NR&&guard<500){
+    guard++;
+    const rw=3+Math.floor(rng()*5),rh=3+Math.floor(rng()*5);
+    const rx=1+Math.floor(rng()*(MW-rw-2)),ry=1+Math.floor(rng()*(MH-rh-2));
+    let ok=true;
+    for(let i=0;i<rooms.length;i++){
+      const r=rooms[i];
+      if(rx<r.x+r.w+1&&rx+rw+1>r.x&&ry<r.y+r.h+1&&ry+rh+1>r.y){ok=false;break;}
+    }
+    if(!ok)continue;
+    rooms.push({x:rx,y:ry,w:rw,h:rh,cx:rx+Math.floor(rw/2),cy:ry+Math.floor(rh/2)});
+    for(let y=ry;y<ry+rh;y++)for(let x=rx;x<rx+rw;x++)grid[y][x]=FLOOR;
+  }
+  if(rooms.length<5)return null;
+  // MST(Prim)で全部屋接続 → 完全接続保証
+  const connected=[0];
+  const rest=rooms.map(function(_,i){return i;}).filter(function(i){return i!==0;});
+  while(rest.length){
+    let bi=0,bj=0,bd=1e9;
+    for(let ci of connected){
+      for(let ri of rest){
+        const d=Math.abs(rooms[ci].cx-rooms[ri].cx)+Math.abs(rooms[ci].cy-rooms[ri].cy);
+        if(d<bd){bd=d;bi=ci;bj=ri;}
+      }
+    }
+    carveCorridor(grid,rooms[bi],rooms[bj],rng);
+    connected.push(bj);rest.splice(rest.indexOf(bj),1);
+  }
+  // 環状通路
+  const loops=Math.max(1,Math.floor(rooms.length*0.15));
+  for(let i=0;i<loops;i++){
+    const a=rooms[Math.floor(rng()*rooms.length)],b=rooms[Math.floor(rng()*rooms.length)];
+    if(a!==b)carveCorridor(grid,a,b,rng);
+  }
+  const entry=rooms[0];
+  let far=rooms[0],fd=-1;
+  for(const r of rooms){
+    const d=Math.abs(r.cx-entry.cx)+Math.abs(r.cy-entry.cy);
+    if(d>fd){fd=d;far=r;}
+  }
+  let gate=null,savept=null;
+  if(floor%10===0){
+    const cells=[];
+    for(let y=far.y;y<far.y+far.h;y++)for(let x=far.x;x<far.x+far.w;x++)cells.push({x:x,y:y});
+    if(cells.length>=4){gate={x:cells[0].x,y:cells[0].y};savept={x:cells[1].x,y:cells[1].y};}
+    else{gate={x:far.cx,y:far.cy};savept={x:far.cx+1,y:far.cy};}
+  }
+  return {grid:grid,rooms:rooms,entry:{x:entry.cx,y:entry.cy},exit:{x:far.cx,y:far.cy},gate:gate,savept:savept};
+}
+function carveCorridor(g,a,b,rng){
+  const horizFirst=rng()<0.5;
+  const x0=a.cx,y0=a.cy,x1=b.cx,y1=b.cy;
+  const carve=function(x,y){if(x>0&&y>0&&x<MW-1&&y<MH-1)g[y][x]=FLOOR;};
+  if(horizFirst){
+    for(let x=Math.min(x0,x1);x<=Math.max(x0,x1);x++)carve(x,y0);
+    for(let y=Math.min(y0,y1);y<=Math.max(y0,y1);y++)carve(x1,y);
+  }else{
+    for(let y=Math.min(y0,y1);y<=Math.max(y0,y1);y++)carve(x0,y);
+    for(let x=Math.min(x0,x1);x<=Math.max(x0,x1);x++)carve(x,y1);
+  }
+}
+function validateMap(g){
+  const seen=new Set([g.entry.y*MW+g.entry.x]);
+  const q=[[g.entry.x,g.entry.y]];
+  while(q.length){
+    const c=q.shift(),x=c[0],y=c[1];
+    const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+    for(const d of dirs){
+      const nx=x+d[0],ny=y+d[1];
+      if(nx<0||ny<0||nx>=MW||ny>=MH)continue;
+      const k=ny*MW+nx;
+      if(seen.has(k)||g.grid[ny][nx]!==FLOOR)continue;
+      seen.add(k);q.push([nx,ny]);
+    }
+  }
+  if(!seen.has(g.exit.y*MW+g.exit.x))return false;
+  if(g.gate&&!seen.has(g.gate.y*MW+g.gate.x))return false;
+  if(g.savept&&!seen.has(g.savept.y*MW+g.savept.x))return false;
+  return true;
+}
+function fallbackMap(){
+  const grid=Array.from({length:MH},function(){return new Array(MW).fill(WALL);});
+  for(let x=2;x<MW-2;x++){grid[14][x]=FLOOR;grid[15][x]=FLOOR;}
+  const rooms=[{x:2,y:13,w:5,h:3,cx:4,cy:14},{x:MW-7,y:13,w:5,h:3,cx:MW-5,cy:14}];
+  return {grid:grid,rooms:rooms,entry:{x:4,y:14},exit:{x:MW-5,y:14}};
+}
+function isFloor(x,y){return x>=0&&y>=0&&x<MW&&y<MH&&MAP.grid[y][x]===FLOOR;}
+
+// ============================================================
+// ダンジョン状態 (ターン制・マス目)
+// ============================================================
+let DUNGEON=null;
+const TURN={phase:"player",t:0,q:null,i:0,busy:false};
+function enterFloor(floor,fromGate){
+  genMap(floor,RUN_SEED);
+  const rng=mulberry32((RUN_SEED^floor*2654435761|0)>>>0);
+  const theme=themeOf(floor);
+  const enemies=[];
+  const drops=[];
+  const isBossFloor=(floor===100);
+  const cells=[];
+  for(let y=0;y<MH;y++)for(let x=0;x<MW;x++)if(isFloor(x,y))cells.push({x:x,y:y});
+  const occupied={};
+  occupied[MAP.entry.y*MW+MAP.entry.x]=1;
+  occupied[MAP.exit.y*MW+MAP.exit.x]=1;
+  if(MAP.gate)occupied[MAP.gate.y*MW+MAP.gate.x]=1;
+  if(MAP.savept)occupied[MAP.savept.y*MW+MAP.savept.x]=1;
+  // 宝箱(マス1つ)
+  const chests=[];
+  const nCh=2+Math.floor(rng()*2);
+  for(let i=0;i<nCh;i++){
+    const c=cells[Math.floor(rng()*cells.length)];
+    const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+    if(d<5||occupied[c.y*MW+c.x])continue;
+    occupied[c.y*MW+c.x]=1;
+    chests.push({tx:c.x,ty:c.y,open:false,item:pickChestItem(floor,rng)});
+  }
+  // 敵(マス1つ、重複禁止)
+  const eCount=isBossFloor?6:Math.min(24,6+Math.floor(floor*0.22));
+  let placed=0,tries=0;
+  while(placed<eCount&&tries<800){
+    tries++;
+    const c=cells[Math.floor(rng()*cells.length)];
+    const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+    if(d<6||occupied[c.y*MW+c.x])continue;
+    occupied[c.y*MW+c.x]=1;
+    const pool=theme.enemies;
+    const id=pool[Math.floor(rng()*pool.length)];
+    enemies.push(spawnEnemy(id,c.x,c.y,floor));
+    placed++;
+  }
+  if(isBossFloor){
+    // ボスは階段の隣の床マスに
+    let bt=null;
+    for(let dy=-1;dy<=1&&!bt;dy++)for(let dx=-1;dx<=1;dx++){
+      const bx=MAP.exit.x+dx,by=MAP.exit.y+dy;
+      if(isFloor(bx,by)&&!occupied[by*MW+bx]){bt={x:bx,y:by};break;}
+    }
+    if(!bt)bt={x:MAP.entry.x,y:MAP.entry.y};
+    enemies.push(spawnEnemy("boss_karaage",bt.x,bt.y,floor));
+  }
+  // ドロップ(マス1つ、敵と重複可)
+  const dCount=8+Math.floor(rng()*6);
+  for(let i=0;i<dCount;i++){
+    const c=cells[Math.floor(rng()*cells.length)];
+    const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+    if(d<3)continue;
+    drops.push(makeDrop(c.x,c.y,floor,rng));
+  }
+  DUNGEON={
+    floor:floor,theme:theme,enemies:enemies,drops:drops,chests:chests,
+    ebullets:[],particles:[],floats:[],
+    player:null,time:0,shake:0,turn:1,
+    bossDead:false,clearDone:false,
+    warnings:[]
+  };
+  DUNGEON.player=makePlayer(MAP.entry.x,MAP.entry.y);
+  TURN.phase="player";TURN.q=null;TURN.i=0;TURN.t=0;TURN.busy=false;
+  collectDrops(DUNGEON.player);
+  SAVE.floorsVisited[floor]=true;
+  if(floor>SAVE.maxFloor)SAVE.maxFloor=floor;
+  if(floor%10===0)UI.toast(floor+"F: セーブポイントとワープゲート");
+  playBGM(floor===100?"bgm_boss.ogg":"bgm_dungeon.ogg");
+  if(!fromGate)playSFX("sfx_stairs.ogg");
+  UI.toast(floor+"F "+theme.name+" (ターン制)");
+  if(floor===100)playVoice("voice_boss_in.ogg");
+}
+function spawnEnemy(id,tx,ty,floor){
+  const base=EBY[id];
+  const scale=1+(floor-1)*0.045;
+  const lvBonus=SAVE?1+Math.max(0,SAVE.lv-1)*0.03:1;
+  const hp=Math.floor(base.hp*scale*lvBonus);
+  return {
+    id:id,name:base.name,tx:tx,ty:ty,
+    x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,
+    r:base.r,
+    hp:hp,hpMax:hp,
+    atk:Math.floor(base.atk*(1+(floor-1)*0.03)),
+    def:Math.floor(base.def*(1+(floor-1)*0.02)),
+    spd:base.spd,xp:Math.floor(base.xp*(1+(floor-1)*0.02)),
+    gold:[base.gold[0],base.gold[1]],
+    kind:base.kind,theme:base.theme,col:base.col,
+    dirIdx:4,
+    fireCd:2+Math.floor(Math.random()*2),
+    chargeWarn:null,chargePath:null,
+    hitT:0,freezeT:0,dead:false,animT:Math.random()*6,
+    flying:base.kind==="flying",
+    size:base.size
+  };
+}
+function makePlayer(tx,ty){
+  return {
+    tx:tx,ty:ty,
+    x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,
+    r:13,hp:SAVE.hp,mp:SAVE.mp,
+    dirIdx:0,swing:0,
+    skillCd:[0,0,0],
+    hitT:0,guardT:0,dashBonusT:0,
+    summon:null,
+    animT:0,moving:false
+  };
+}
+function makeDrop(tx,ty,floor,rng){
+  const t=rng();
+  let id;
+  if(t<0.34)id="p_hp_s";
+  else if(t<0.50)id="p_mp";
+  else if(t<0.64)id="gold";
+  else if(t<0.80)id="exp";
+  else if(t<0.90)id="s_mat";
+  else if(t<0.96)id="p_hp_l";
+  else id="gold";
+  let n=1,amount=0;
+  if(id==="gold")amount=5+Math.floor(rng()*(8+floor*0.8));
+  if(id==="exp")amount=10+Math.floor(rng()*15+floor*0.5);
+  if(id==="p_hp_s")n=1+Math.floor(rng()*2);
+  return {tx:tx,ty:ty,x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,id:id,n:n,amount:amount,bob:rng()*6,got:false};
+}
+function pickChestItem(floor,rng){
+  const tier=Math.min(6,1+Math.floor(floor/18));
+  const w=WEAPONS.filter(function(it){return it.tier<=tier;});
+  const a=ARMORS.filter(function(it){return it.tier<=tier;});
+  const r=rng();
+  if(r<0.45)return {kind:"weapon",id:w[Math.floor(rng()*w.length)].id};
+  if(r<0.75)return {kind:"armor",id:a[Math.floor(rng()*a.length)].id};
+  if(r<0.90)return {kind:"ring",id:RINGS[Math.floor(rng()*RINGS.length)].id};
+  return {kind:"weapon",id:WEAPONS[Math.min(WEAPONS.length-1,Math.floor(rng()*(tier+1)))].id};
+}
+// 装備: 旧装備はバックパックへ退避
+function addItemEquip(item){
+  const slot=item.kind;
+  const old=SAVE.equip[slot];
+  if(old)SAVE.inv.push({id:old,n:1});
+  SAVE.equip[slot]=item.id;
+  const it=ALL_ITEMS[item.id];
+  if(it)UI.toast("装備: "+it.name);
+}
+function itemSlotOf(def){
+  if(WEAPONS.indexOf(def)>=0)return "weapon";
+  if(ARMORS.indexOf(def)>=0)return "armor";
+  if(RINGS.indexOf(def)>=0)return "ring";
+  return null;
+}
+function equipFromBag(invIdx){
+  const it=SAVE.inv[invIdx];
+  if(!it)return false;
+  const def=ALL_ITEMS[it.id];
+  const realSlot=itemSlotOf(def);
+  if(!realSlot)return false;
+  const old=SAVE.equip[realSlot];
+  SAVE.inv.splice(invIdx,1);
+  if(old)SAVE.inv.push({id:old,n:1});
+  SAVE.equip[realSlot]=it.id;
+  UI.toast("装備: "+def.name);
+  return true;
+}
+// マス占有判定
+function enemyAt(tx,ty){
+  for(const e of DUNGEON.enemies)if(!e.dead&&e.tx===tx&&e.ty===ty)return e;
+  return null;
+}
+function canStep(tx,ty,ignoreEnemy){
+  if(!isFloor(tx,ty))return false;
+  if(DUNGEON.player.tx===tx&&DUNGEON.player.ty===ty)return false;
+  const e=enemyAt(tx,ty);
+  if(e&&!ignoreEnemy)return false;
+  return true;
+}
+function canDiag(ax,ay,bx,by){
+  // (ax,ay)=水平ステップ, (bx,by)=垂直ステップ — 両方が床でないと対角不可
+  return isFloor(ax,ay)&&isFloor(bx,by);
+}
+// 足元のドロップ収集(自由)
+function collectDrops(p){
+  for(const dr of DUNGEON.drops){
+    if(dr.got||dr.tx!==p.tx||dr.ty!==p.ty)continue;
+    dr.got=true;
+    if(dr.id==="gold"){
+      SAVE.gold+=dr.amount;
+      playSFX("sfx_pickup.ogg",1.1);
+      UI.float(p.x,p.y-16,"+"+dr.amount+"G","#ffd24a",13);
+    }else if(dr.id==="exp"){
+      gainXp(dr.amount);
+      playSFX("sfx_pickup.ogg",1.2);
+      UI.float(p.x,p.y-16,"+"+dr.amount+"EXP","#7ec8ff",13);
+    }else{
+      addItem(dr.id,dr.n);
+      playSFX("sfx_pickup.ogg");
+    }
+  }
+}
+// 敵フェーズ終了後: 階段に立ち止まっていた場合の降下(100Fのみボス撃破必須)
+function checkStairsDescend(){
+  const p=DUNGEON.player;
+  if(p.tx===MAP.exit.x&&p.ty===MAP.exit.y){
+    if(DUNGEON.floor>=100){
+      if(DUNGEON.bossDead)doClear();
+      return;
+    }
+    nextFloor();
+  }
+}
+function doClear(){
+  G.screen="clear";
+  stopBGM();
+  playBGM("bgm_clear.ogg");
+  playVoice("voice_clear.ogg");
+  playSFX("sfx_victory.ogg");
+  SAVE.cleared=true;
+  if(!SAVE.equip.weapon||!ALL_ITEMS[SAVE.equip.weapon].legend)SAVE.equip.weapon="w_holy";
+  if(!SAVE.equip.armor||!ALL_ITEMS[SAVE.equip.armor].legend)SAVE.equip.armor="a_crown";
+  storeSave();
+}
+
+// ============================================================
+// 戦闘 (ターン制)
+// ============================================================
+function calcMeleeDmg(atk,def){
+  return Math.max(1,Math.floor(atk*(0.85+Math.random()*0.3)-def*0.5));
+}
+function attackAction(){
+  const p=DUNGEON.player,d=dStats();
+  p.swing=0.22;
+  const v=DIRS[p.dirIdx];
+  const e=enemyAt(p.tx+v[0],p.ty+v[1]);
+  let hitAny=false;
+  if(e){
+    damageEnemy(e,calcMeleeDmg(d.atk,e.def));
+    hitAny=true;
+  }
+  if(hitAny)playSFX("sfx_hit.ogg");else playSFX("sfx_swing.ogg");
+  if(SAVE.job==="hero"&&SAVE.equip.weapon){
+    SAVE.mastery[SAVE.equip.weapon]=(SAVE.mastery[SAVE.equip.weapon]||0)+0.1;
+  }
+  spawnArcFX(p.x,p.y,dirAngle(p.dirIdx),hitAny);
+  endPlayerTurn();
+}
+function damageEnemy(e,dmg){
+  if(e.dead)return;
+  e.hp-=dmg;e.hitT=0.18;
+  UI.float(e.x,e.y-e.r-6,"-"+dmg,"#ffd24a",14);
+  spawnHitFX(e.x,e.y);
+  if(e.hp<=0)killEnemy(e);
+}
+function killEnemy(e){
+  e.dead=true;
+  playSFX("sfx_ehit.ogg",0.9);
+  spawnDeathFX(e.x,e.y,e.col);
+  const g=e.gold[0]+Math.floor(Math.random()*(e.gold[1]-e.gold[0]+1));
+  DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:"gold",n:1,amount:g,bob:0,got:false});
+  DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:"exp",n:1,amount:e.xp,bob:0,got:false});
+  if(Math.random()<0.12)DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:"p_hp_s",n:1,amount:0,bob:0,got:false});
+  gainXp(Math.floor(e.xp*0.5));
+  if(e.id==="boss_karaage"){
+    DUNGEON.bossDead=true;
+    SAVE.bossDown=true;
+    playSFX("sfx_boss.ogg");
+    playVoice("voice_boss_die.ogg");
+    DUNGEON.shake=14;
+  }
+}
+function damagePlayer(dmg){
+  const p=DUNGEON.player;
+  if(!p||G.screen!=="dungeon")return;
+  if(p.guardT>0){
+    dmg=Math.max(1,Math.floor(dmg*0.25));
+    playSFX("sfx_guard.ogg");
+    spawnGuardFX(p.x,p.y);
+  }
+  const d=dStats();
+  const real=Math.max(1,Math.floor(dmg-d.def*0.6));
+  p.hp-=real;
+  SAVE.hp=p.hp;
+  p.hitT=0.25;
+  DUNGEON.shake=6;
+  playSFX("sfx_ehit.ogg",1.1);
+  UI.float(p.x,p.y-20,"-"+real,"#ff5a5a",16);
+  spawnHitFX(p.x,p.y);
+  if(p.hp<=0){p.hp=0;SAVE.hp=0;onDeath();}
+}
+function onDeath(){
+  stopBGM();
+  playSFX("sfx_death.ogg");
+  SAVE.gold=0;
+  SAVE.equip={weapon:null,armor:null,ring:null};
+  SAVE.inv=[];
+  storeSave();
+  G.screen="gameover";
+  UI.gameoverReason="全ての装備・金・アイテムを失った…(レベルと解放した階は保持)";
+}
+function useSkill(i){
+  const p=DUNGEON.player;
+  if(!p)return;
+  const sk=JOBS[SAVE.job].skills[i];
+  if(!sk)return;
+  // 後退(召喚収容)はターン消費しない
+  const free=SAVE.job==="summoner"&&i===2;
+  if(p.skillCd[i]>0||p.mp<sk.mp)return;
+  if(!free){
+    p.mp-=sk.mp;
+    SAVE.mp=p.mp;
+    p.skillCd[i]=sk.cd;
+  }
+  const d=dStats();
+  if(SAVE.job==="hero"){
+    if(i===0){
+      const v=DIRS[p.dirIdx];
+      const e=enemyAt(p.tx+v[0],p.ty+v[1]);
+      if(e){
+        damageEnemy(e,Math.max(1,Math.floor(d.atk*2.2-e.def*0.5)));
+        DUNGEON.shake=8;
+      }
+      playSFX("sfx_skill.ogg");
+      spawnArcFX(p.x,p.y,dirAngle(p.dirIdx),true);
+    }else if(i===1){
+      const v=DIRS[p.dirIdx];
+      let moved=0;
+      for(let k=1;k<=3;k++){
+        const nx=p.tx+v[0]*k,ny=p.ty+v[1]*k;
+        if(!isFloor(nx,ny)||enemyAt(nx,ny))break;
+        p.tx=nx;p.ty=ny;moved=k;
+      }
+      if(moved)UI.float(p.x,p.y-24,"突進!","#8ae8ff",14);
+      playSFX("sfx_skill.ogg");
+    }else{
+      const heal=Math.floor(d.hpMax*0.35);
+      p.hp=Math.min(d.hpMax,p.hp+heal);SAVE.hp=p.hp;
+      playSFX("sfx_potion.ogg");
+      UI.float(p.x,p.y-24,"+"+heal,"#5aff8a",16);
+      spawnHealFX(p.x,p.y);
+    }
+  }else if(SAVE.job==="paladin"){
+    if(i===0){
+      const dmg=d.mag*2.4;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=1){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+        }
+      }
+      DUNGEON.shake=5;playSFX("sfx_skill.ogg");spawnHolyFX(p.x,p.y,false);
+    }else if(i===1){
+      p.guardT=1;
+      playSFX("sfx_guard.ogg");spawnGuardFX(p.x,p.y);
+      UI.float(p.x,p.y-24,"神聖の盾","#8ae8ff",14);
+    }else{
+      const dmg=d.mag*1.8;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=2){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+        }
+      }
+      DUNGEON.shake=7;playSFX("sfx_skill.ogg");spawnHolyFX(p.x,p.y,true);
+    }
+  }else if(SAVE.job==="mage"){
+    SAVE.magicXp=Math.min(10,SAVE.magicXp+0.2);
+    if(i===0){
+      // 直線6マス・火球(初命中)
+      const v=DIRS[p.dirIdx];
+      let hitE=null;
+      for(let k=1;k<=6;k++){
+        const nx=p.tx+v[0]*k,ny=p.ty+v[1]*k;
+        if(!isFloor(nx,ny))break;
+        const e=enemyAt(nx,ny);
+        if(e){hitE=e;break;}
+      }
+      if(hitE){
+        damageEnemy(hitE,Math.max(1,Math.floor(d.mag*1.6-hitE.def*0.4)));
+        spawnFireBallFX(hitE);
+      }
+      playSFX("sfx_skill.ogg");
+    }else if(i===1){
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=1){
+          damageEnemy(e,Math.max(1,Math.floor(d.mag*1.5-e.def*0.4)));
+          e.freezeT=2;
+        }
+      }
+      playSFX("sfx_skill.ogg");spawnIceFX(p.x,p.y);
+    }else{
+      let target=null,bd=1e9;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        const dist=chebyshev(e,p);
+        if(dist<bd){bd=dist;target=e;}
+      }
+      if(target){
+        damageEnemy(target,Math.max(1,Math.floor(d.mag*2.8-target.def*0.4)));
+        spawnLightningFX(target.x,target.y);
+      }
+      playSFX("sfx_skill.ogg");DUNGEON.shake=5;
+    }
+  }else if(SAVE.job==="summoner"){
+    if(i===0){
+      if(p.summon){UI.toast("すでに召喚済み");p.mp+=sk.mp;SAVE.mp=p.mp;return;}
+      if(!Object.keys(SAVE.summons).length)SAVE.summons["summon_ken"]=1;
+      const sid=Object.keys(SAVE.summons)[0];
+      const st=SAVE.summons[sid];
+      const sdef=SUMMON_BY[sid];
+      const hpMul=SUM_STAGE.hp[st-1],atkMul=SUM_STAGE.atk[st-1];
+      // 隣接の空きマスに出現
+      let sx=p.tx,sy=p.ty;
+      for(let k=0;k<8&&!isSummonSpot(sx,sy);k++){
+        const v=DIRS[k];
+        if(isFloor(p.tx+v[0],p.ty+v[1])&&!enemyAt(p.tx+v[0],p.ty+v[1])){sx=p.tx+v[0];sy=p.ty+v[1];}
+      }
+      p.summon={id:sid,stage:st,tx:sx,ty:sy,x:(sx+0.5)*TILE,y:(sy+0.5)*TILE,dirIdx:p.dirIdx,
+        hp:40*hpMul,hpMax:40*hpMul,atk:8*atkMul,fireCd:1,animT:0,ai:sdef.ai,atkBuffT:0,actT:0};
+      playSFX("sfx_summon.ogg");
+      UI.toast(sdef.name+" を召喚! (段階"+st+")");
+      spawnSummonFX((sx+0.5)*TILE,(sy+0.5)*TILE,sdef.col);
+    }else if(i===1){
+      if(!p.summon){UI.toast("召喚獣がいない");p.mp+=sk.mp;SAVE.mp=p.mp;return;}
+      p.summon.hp=p.summon.hpMax;
+      p.summon.atkBuffT=3;
+      playSFX("sfx_summon.ogg");
+      UI.toast("獣が力を取り戻した!(3ターン強化)");
+    }else{
+      if(p.summon){p.summon=null;playSFX("sfx_click.ogg");UI.toast("召喚獣を収めた");}
+      else UI.toast("召喚獣がいない");
+      return;
+    }
+  }else if(SAVE.job==="unjob"){
+    if(i===0){
+      const dmg=d.atk*1.6+d.mag*1.2;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=1){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+        }
+      }
+      playSFX("sfx_skill.ogg");spawnArcFX(p.x,p.y,dirAngle(p.dirIdx),true);
+    }else if(i===1){
+      p.dashBonusT=2;
+      playSFX("sfx_skill.ogg");
+      UI.float(p.x,p.y-24,"無双乱舞!","#ff5a5a",14);
+    }else{
+      const ratio=1-p.hp/d.hpMax;
+      const dmg=d.atk*(1+ratio*3);
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=2){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.3)));
+        }
+      }
+      DUNGEON.shake=9;playSFX("sfx_skill.ogg");spawnBerserkFX(p.x,p.y);
+    }
+  }
+  if(!free)endPlayerTurn();
+}
+function chebyshev(a,b){return Math.max(Math.abs(a.tx-b.tx),Math.abs(a.ty-b.ty));}
+function isSummonSpot(tx,ty){return isFloor(tx,ty)&&!enemyAt(tx,ty)&&!(DUNGEON.player.tx===tx&&DUNGEON.player.ty===ty);}
+function spawnFireBallFX(e){
+  for(let i=0;i<12;i++){
+    const a=Math.random()*Math.PI*2,sp=3*Math.random();
+    P(e.x,e.y,Math.cos(a)*sp,Math.sin(a)*sp,0.4,"#ff8a2e",3);
+  }
+}
+
+// ============================================================
+// ターン進行
+// ============================================================
+function endPlayerTurn(consumed){
+  if(consumed===undefined)consumed=true;
+  const p=DUNGEON.player;
+  DUNGEON.turn++;
+  if(consumed){
+    p.mp=Math.min(dStats().mpMax,p.mp+2);
+    SAVE.mp=p.mp;
+    for(let i=0;i<3;i++)if(p.skillCd[i]>0)p.skillCd[i]--;
+    if(p.guardT>0)p.guardT--;
+    if(p.dashBonusT>0)p.dashBonusT--;
+    if(p.summon&&p.summon.atkBuffT>0)p.summon.atkBuffT--;
+  }
+  p.moving=false;
+  TURN.phase="anim";
+  TURN.t=consumed?0.16:0.05;
+  TURN.toEnemy=consumed;
+}
+function updateTurn(dt){
+  const D=DUNGEON;
+  if(!D||!D.player||G.screen!=="dungeon")return;
+  // 移動Tween(常時: 画面表示中でも滑らかに)
+  if(!G.paused)tweenEntities(dt);
+  // 待機/整理/ポーズ中はターン進行しない
+  if(G.paused||UI.bag||UI.gate||UI.help)return;
+  if(TURN.phase==="player"){
+    handlePlayerInput();
+  }else if(TURN.phase==="anim"){
+    TURN.t-=dt;
+    if(TURN.t<=0){
+      if(TURN.toEnemy){
+        TURN.phase="enemy";
+        TURN.q=D.enemies.filter(function(e){return !e.dead;});
+        TURN.i=0;TURN.t=0.06;
+      }else{
+        TURN.phase="player";
+      }
+    }
+  }else if(TURN.phase==="enemy"){
+    TURN.t-=dt;
+    if(TURN.t<=0){
+      if(TURN.i<TURN.q.length){
+        const e=TURN.q[TURN.i];
+        if(!e.dead)enemyAct(e);
+        TURN.i++;
+        TURN.t=0.1;
+      }else{
+        // 敵フェーズ終了: 弾移動
+        moveEbullets();
+        D.enemies=D.enemies.filter(function(e){return !e.dead;});
+        D.drops=D.drops.filter(function(dr){return !dr.got;});
+        // 警告は突進実行まで残す(死んだ敵の分だけ掃除)
+        D.warnings=D.warnings.filter(function(w){return !w.e||(!w.e.dead&&w.e.chargeWarn);});
+        TURN.phase="player";
+        D._summonPending=true;
+        if(G.screen==="dungeon")checkStairsDescend();
+      }
+    }
+  }
+}
+function handlePlayerInput(){
+  const p=DUNGEON.player;
+  const D=DUNGEON;
+  let mx=0,my=0;
+  if(key("KeyA","ArrowLeft"))mx-=1;
+  if(key("KeyD","ArrowRight"))mx+=1;
+  if(key("KeyW","ArrowUp"))my-=1;
+  if(key("KeyS","ArrowDown"))my+=1;
+  if(mx||my){
+    const di=dirIndex(mx,my);
+    p.dirIdx=di;
+    tryMovePlayer(di);
+    return;
+  }
+  if(keyP("KeyZ","KeyJ")){attackAction();return;}
+  if(keyP("KeyX","KeyK")){useSkill(0);return;}
+  if(keyP("KeyC","KeyL")){useSkill(1);return;}
+  if(keyP("KeyV")){useSkill(2);return;}
+  if(keyP("Digit1")){if(quickUse("p_hp_s"))endPlayerTurn();return;}
+  if(keyP("Digit2")){if(quickUse("p_hp_l"))endPlayerTurn();return;}
+  if(keyP("Digit3")){if(quickUse("p_mp"))endPlayerTurn();return;}
+  if(keyP("Space")){endPlayerTurn();}
+}
+function dirIndex(mx,my){
+  for(let i=0;i<8;i++){
+    if(DIRS[i][0]===Math.sign(mx)&&DIRS[i][1]===Math.sign(my))return i;
+  }
+  return mx>0?0:mx<0?4:my>0?2:6;
+}
+function tryMovePlayer(di){
+  const p=DUNGEON.player;
+  const v=DIRS[di];
+  let nx=p.tx+v[0],ny=p.ty+v[1];
+  const diag=v[0]!==0&&v[1]!==0;
+  if(diag&&!canDiag(p.tx+v[0],p.ty,p.tx,p.ty+v[1])){
+    // コーナーカット不可 → 直交方向に逸らす
+    if(isFloor(nx,p.ty)&&!enemyAt(nx,p.ty))ny=p.ty;
+    else if(isFloor(p.tx,ny)&&!enemyAt(p.tx,ny))nx=p.tx;
+    else {p.dirIdx=di;return;}
+  }
+  const e=enemyAt(nx,ny);
+  if(!isFloor(nx,ny)){p.dirIdx=di;return;}
+  if(e){p.dirIdx=di;return;}
+  p.tx=nx;p.ty=ny;
+  p.dirIdx=di;
+  p.moving=true;
+  // 無双乱舞: 1行動で2マス
+  if(p.dashBonusT>0){
+    const nx2=p.tx+v[0],ny2=p.ty+v[1];
+    if(isFloor(nx2,ny2)&&!enemyAt(nx2,ny2)&&!(DUNGEON.player.tx===nx2&&DUNGEON.player.ty===ny2)){
+      p.tx=nx2;p.ty=ny2;
+    }
+  }
+  collectDrops(p);
+  // 階段(最終位置で判定) — 100F以外: 残敵があっても降下可。100Fのみボス撃破必須
+  if(p.tx===MAP.exit.x&&p.ty===MAP.exit.y){
+    if(DUNGEON.floor>=100){
+      if(DUNGEON.bossDead){doClear();return;}
+      UI.toast("先に魔王を倒せ!");
+      endPlayerTurn();
+      return;
+    }
+    nextFloor();
+    return;
+  }
+  // 宝箱(1ターン)
+  for(const c of DUNGEON.chests){
+    if(!c.open&&c.tx===p.tx&&c.ty===p.ty){
+      c.open=true;
+      playSFX("sfx_pickup.ogg",0.9);
+      const it=ALL_ITEMS[c.item.id];
+      UI.toast("宝箱: "+it.name+" を獲得!");
+      addItemEquip(c.item);
+      storeSave();
+      endPlayerTurn();
+      return;
+    }
+  }
+  freeTileInteract();
+  endPlayerTurn();
+}
+function freeTileInteract(){
+  const p=DUNGEON.player;
+  if(MAP.savept&&p.tx===MAP.savept.x&&p.ty===MAP.savept.y){
+    storeSave();
+    playSFX("sfx_stairs.ogg");
+    UI.toast("セーブした。この階から再挑戦できる");
+  }
+  if(MAP.gate&&p.tx===MAP.gate.x&&p.ty===MAP.gate.y&&!UI.gate&&!DUNGEON._gateDone){
+    DUNGEON._gateDone=true;
+    G.gateOpen=true;
+    openGateMenu(false);
+  }
+}
+
+// ============================================================
+// 敵AI (ターン制: 敵フェーズでのみ1体ずつ行動)
+// ============================================================
+function enemyAct(e){
+  const p=DUNGEON.player;
+  if(e.dead)return;
+  if(e.freezeT>0){e.freezeT--;UI.float(e.x,e.y-e.r-6,"凍結","#bfe8ff",12);return;}
+  const dist=chebyshev(e,p);
+  // 方向インデックス(プレイヤーの方)
+  e.dirIdx=dirTo(e.tx,e.ty,p.tx,p.ty);
+  if(e.kind==="boss"){bossAct(e,dist);return;}
+  if(e.chargeWarn){
+    // 突進実行
+    executeCharge(e);
+    return;
+  }
+  if(e.kind==="chase"){
+    if(dist<=1){meleeEnemy(e,1);return;}
+    stepToward(e,p.tx,p.ty,false);
+  }else if(e.kind==="flying"){
+    if(dist<=1){meleeEnemy(e,1.1);return;}
+    if(dist<=3){
+      // 距離を保つ
+      if(Math.random()<0.4)stepToward(e,p.tx-1,p.ty-1,true);
+    }else stepToward(e,p.tx,p.ty,true);
+  }else if(e.kind==="shoot"){
+    e.fireCd--;
+    if(e.fireCd<=0&&dist<=7&&dist>=2&&hasLOS(e.tx,e.ty,p.tx,p.ty)){
+      e.fireCd=3;
+      const v=DIRS[e.dirIdx];
+      DUNGEON.ebullets.push({tx:e.tx+v[0],ty:e.ty+v[1],x:(e.tx+v[0]+0.5)*TILE,y:(e.ty+v[1]+0.5)*TILE,
+        dx:v[0],dy:v[1],dmg:e.atk,col:e.col});
+      playSFX("sfx_skill.ogg",1.3);
+      return;
+    }
+    if(dist<3)stepToward(e,p.tx-1,p.ty-1,false);
+    else if(dist>6)stepToward(e,p.tx,p.ty,false);
+    else if(Math.random()<0.5)stepToward(e,p.tx,p.ty,false);
+  }else if(e.kind==="charge"){
+    if(dist<=1){meleeEnemy(e,1);return;}
+    if(dist<=6&&Math.random()<0.45){
+      // 突進予告
+      const v=DIRS[e.dirIdx];
+      const path=[];
+      for(let k=1;k<=4;k++){
+        const nx=e.tx+v[0]*k,ny=e.ty+v[1]*k;
+        if(!isFloor(nx,ny))break;
+        path.push({x:nx,y:ny});
+        if(nx===p.tx&&ny===p.ty)break;
+      }
+      if(path.length){
+        e.chargeWarn={dx:v[0],dy:v[1],path:path};
+        DUNGEON.warnings.push({e:e,tx:e.tx,ty:e.ty,path:path,col:"#ff9a2e"});
+        playSFX("sfx_boss.ogg",1.1);
+        return;
+      }
+    }
+    stepToward(e,p.tx,p.ty,false);
+  }
+}
+function dirTo(x0,y0,x1,y1){
+  const dx=x1-x0,dy=y1-y0;
+  let best=0,bd=1e9;
+  for(let i=0;i<8;i++){
+    const d=Math.abs(DIRS[i][0]-dx)+Math.abs(DIRS[i][1]-dy);
+    if(d<bd){bd=d;best=i;}
+  }
+  return best;
+}
+function stepToward(e,tx,ty,allowDiagCorner){
+  const cands=[0,1,2,3,4,5,6,7];
+  // 近い方向から
+  cands.sort(function(a,b){
+    const da=Math.abs(DIRS[a][0]-(tx-e.tx))+Math.abs(DIRS[a][1]-(ty-e.ty));
+    const db=Math.abs(DIRS[b][0]-(tx-e.tx))+Math.abs(DIRS[b][1]-(ty-e.ty));
+    return da-db;
+  });
+  for(const di of cands){
+    const v=DIRS[di];
+    const nx=e.tx+v[0],ny=e.ty+v[1];
+    if(nx===e.tx&&ny===e.ty)continue;
+    if(!isFloor(nx,ny))continue;
+    if(DUNGEON.player.tx===nx&&DUNGEON.player.ty===ny)continue;
+    if(enemyAt(nx,ny))continue;
+    const diag=v[0]!==0&&v[1]!==0;
+    if(diag&&!e.flying&&!canDiag(e.tx+v[0],e.ty,e.tx,e.ty+v[1]))continue;
+    e.tx=nx;e.ty=ny;
+    e.dirIdx=di;
+    return;
+  }
+}
+function hasLOS(x0,y0,x1,y1){
+  let x=x0,y=y0;
+  while(x!==x1||y!==y1){
+    let sx=Math.sign(x1-x),sy=Math.sign(y1-y);
+    // 対角はどちらか先に進み、壁チェック
+    if(sx!==0&&sy!==0){
+      if(!isFloor(x+sx,y)||!isFloor(x,y+sy))return false;
+    }else if(sx!==0){
+      if(!isFloor(x+sx,y))return false;
+    }else{
+      if(!isFloor(x,y+sy))return false;
+    }
+    x+=sx;y+=sy;
+  }
+  return true;
+}
+function meleeEnemy(e,mult){
+  damagePlayer(e.atk*mult);
+  spawnHitFX(DUNGEON.player.x,DUNGEON.player.y);
+}
+function executeCharge(e){
+  const p=DUNGEON.player;
+  const w=e.chargeWarn;
+  e.chargeWarn=null;
+  DUNGEON.warnings=DUNGEON.warnings.filter(function(q){return q.e!==e;});
+  let hit=false;
+  for(const c of w.path){
+    if(!isFloor(c.x,c.y))break;
+    if(enemyAt(c.x,c.y)&&!(DUNGEON.player.tx===c.x&&DUNGEON.player.ty===c.y))break;
+    if(p.tx===c.x&&p.ty===c.y){hit=true;break;}
+    e.tx=c.x;e.ty=c.y;
+  }
+  if(hit){meleeEnemy(e,1.4);DUNGEON.shake=8;}
+  else playSFX("sfx_swing.ogg",0.8);
+}
+function bossAct(e,dist){
+  const p=DUNGEON.player;
+  const phase=e.hp>e.hpMax*0.5?1:2;
+  e.atkCd=(e.atkCd==null?2:phase===2?e.atkCd-1:e.atkCd-1);
+  if(e.chargeWarn){executeCharge(e);return;}
+  if(dist<=1){meleeEnemy(e,1.2);return;}
+  if(e.atkCd<=0){
+    const pat=Math.random();
+    if(pat<0.45){
+      // 放射8方向弾
+      e.atkCd=phase===2?2:3;
+      for(let a=0;a<8;a++){
+        const v=DIRS[a];
+        const nx=e.tx+v[0],ny=e.ty+v[1];
+        if(isFloor(nx,ny)&&!enemyAt(nx,ny)){
+          DUNGEON.ebullets.push({tx:nx,ty:ny,x:(nx+0.5)*TILE,y:(ny+0.5)*TILE,dx:v[0],dy:v[1],dmg:Math.floor(e.atk*0.7),col:"#ff9a2e"});
+        }
+      }
+      playSFX("sfx_boss.ogg");
+    }else if(pat<0.75){
+      // 突進予告
+      e.atkCd=phase===2?2:3;
+      const v=DIRS[e.dirIdx];
+      const path=[];
+      for(let k=1;k<=5;k++){
+        const nx=e.tx+v[0]*k,ny=e.ty+v[1]*k;
+        if(!isFloor(nx,ny))break;
+        path.push({x:nx,y:ny});
+        if(nx===p.tx&&ny===p.ty)break;
+      }
+      if(path.length){e.chargeWarn={dx:v[0],dy:v[1],path:path};DUNGEON.warnings.push({e:e,tx:e.tx,ty:e.ty,path:path,col:"#ff5a5a"});playSFX("sfx_boss.ogg",0.8);}
+      else stepToward(e,p.tx,p.ty,false);
+    }else{
+      // 周囲AoE(半径2)
+      e.atkCd=phase===2?3:4;
+      if(chebyshev(e,p)<=2){
+        damagePlayer(Math.floor(e.atk*0.8));
+      }
+      DUNGEON.shake=8;
+      playSFX("sfx_boss.ogg",1.2);
+      spawnHolyFX(e.x,e.y,true);
+    }
+  }else{
+    stepToward(e,p.tx,p.ty,false);
+  }
+}
+function moveEbullets(){
+  const D=DUNGEON,p=D.player;
+  const next=[];
+  for(const b of D.ebullets){
+    const nx=b.tx+b.dx,ny=b.ty+b.dy;
+    if(!isFloor(nx,ny))continue; // 壁で消滅
+    if(p.tx===nx&&p.ty===ny){
+      damagePlayer(b.dmg);
+      continue;
+    }
+    if(p.summon&&p.summon.tx===nx&&p.summon.ty===ny){
+      p.summon.hp-=b.dmg;
+      continue;
+    }
+    if(enemyAt(nx,ny))continue; // 敵に吸収
+    b.tx=nx;b.ty=ny;
+    b.x=(nx+0.5)*TILE;b.y=(ny+0.5)*TILE;
+    next.push(b);
+  }
+  D.ebullets=next;
+}
+
+// ============================================================
+// 召喚獣AI (ターン制: プレイヤーターンごとに自動1アクション)
+// ============================================================
+function summonAct(s){
+  const p=DUNGEON.player;
+  s.animT++;
+  // 距離が離れすぎたら追走(1マス)
+  if(chebyshev(s,p)>2){
+    stepToward(s,p.tx,p.ty,false);
+    return;
+  }
+  let target=null,bd=1e9;
+  for(const e of DUNGEON.enemies){
+    if(e.dead)continue;
+    const d=chebyshev(s,e);
+    if(s.ai==="stalk"){
+      if(e.hp>e.hpMax*0.5&&d<bd){bd=d;target=e;}
+    }else if(d<bd){bd=d;target=e;}
+  }
+  const atkPower=s.atk*(s.atkBuffT>0?1.5:1);
+  if(target){
+    s.dirIdx=dirTo(s.tx,s.ty,target.tx,target.ty);
+    if(s.ai==="melee"||s.ai==="dash"){
+      if(bd>1){
+        stepToward(s,target.tx,target.ty,false);
+      }else{
+        damageEnemy(target,Math.max(1,Math.floor(atkPower-target.def*0.3)));
+        playSFX("sfx_hit.ogg",1.2);
+      }
+    }else if(s.ai==="shoot"){
+      if(bd<=5&&hasLOS(s.tx,s.ty,target.tx,target.ty)){
+        damageEnemy(target,Math.max(1,Math.floor(atkPower-target.def*0.3)));
+        spawnFireBallFX(target);
+        playSFX("sfx_hit.ogg",1.1);
+      }else stepToward(s,target.tx,target.ty,false);
+    }else if(s.ai==="wall"){
+      if(bd<=1){
+        damageEnemy(target,Math.max(1,Math.floor(atkPower*0.8-target.def*0.3)));
+        spawnGuardFX(s.x,s.y);
+      }
+    }else if(s.ai==="stalk"){
+      if(bd<=1){
+        damageEnemy(target,Math.max(1,Math.floor(atkPower*1.3-target.def*0.3)));
+        playSFX("sfx_hit.ogg",1.1);
+      }else stepToward(s,target.tx,target.ty,false);
+    }
+  }
+  // 被弾(敵弾が自分所在マスに来る場合)
+  for(const b of DUNGEON.ebullets){
+    if(b.tx===s.tx&&b.ty===s.ty){s.hp-=b.dmg;}
+  }
+  if(s.hp<=0){
+    UI.toast(SUMMON_BY[s.id].name+" が倒れた…");
+    p.summon=null;
+    spawnDeathFX(s.x,s.y,SUMMON_BY[s.id].col);
+    return;
+  }
+  // 成長(ターンベース)
+  s.actT++;
+  if(s.actT>=20&&s.stage<10){
+    s.actT=0;
+    s.stage++;
+    SAVE.summons[s.id]=s.stage;
+    s.hpMax=40*SUM_STAGE.hp[s.stage-1];
+    s.hp=s.hpMax;
+    s.atk=8*SUM_STAGE.atk[s.stage-1];
+    UI.toast(SUMMON_BY[s.id].name+" が段階"+s.stage+"に進化した!");
+    spawnSummonFX(s.x,s.y,SUMMON_BY[s.id].col);
+    playSFX("sfx_levelup.ogg",0.9);
+  }
+}
+
+// ============================================================
+// エフェクト
+// ============================================================
+function P(x,y,vx,vy,life,col,r,extra){
+  const pt={x:x,y:y,vx:vx,vy:vy,life:life,col:col,r:r};
+  if(extra)Object.assign(pt,extra);
+  DUNGEON.particles.push(pt);
+}
+function spawnHitFX(x,y){for(let i=0;i<6;i++)P(x,y,(Math.random()-0.5)*4,(Math.random()-0.5)*4,0.3,"#fff",2);}
+function spawnDeathFX(x,y,col){for(let i=0;i<14;i++)P(x,y,(Math.random()-0.5)*6,(Math.random()-0.5)*6-2,0.6,col,3);}
+function spawnArcFX(x,y,dir,big){
+  const n=big?14:8;
+  for(let i=0;i<n;i++){
+    const a=dir+(Math.random()-0.5)*1.6;
+    const sp=(big?5:3.5)*Math.random();
+    P(x+Math.cos(a)*10,y+Math.sin(a)*10,Math.cos(a)*sp,Math.sin(a)*sp,0.25,"#fff2c8",2);
+  }
+}
+function spawnHealFX(x,y){for(let i=0;i<10;i++)P(x+(Math.random()-0.5)*20,y+10,0,-2-Math.random()*2,0.7,"#5aff8a",3);}
+function spawnGuardFX(x,y){for(let i=0;i<8;i++){const a=i/8*Math.PI*2;P(x+Math.cos(a)*20,y+Math.sin(a)*20,0,0,0.4,"#8ae8ff",3);}}
+function spawnHolyFX(x,y,big){const n=big?18:10;for(let i=0;i<n;i++){const a=Math.random()*Math.PI*2;const sp=(big?5:3)*Math.random();P(x,y,Math.cos(a)*sp,Math.sin(a)*sp,0.5,"#fff8d0",3);}}
+function spawnIceFX(x,y){for(let i=0;i<14;i++){const a=i/14*Math.PI*2;P(x+Math.cos(a)*30,y+Math.sin(a)*30,-Math.cos(a)*3,-Math.sin(a)*3,0.6,"#bfe8ff",3);}}
+function spawnLightningFX(x,y){P(x,y,0,0,0.3,"#fff",4,{bolt:true});for(let i=0;i<10;i++)P(x+(Math.random()-0.5)*30,y+(Math.random()-0.5)*30,0,-4,0.4,"#cfe8ff",2);}
+function spawnSummonFX(x,y,col){for(let i=0;i<16;i++){const a=i/16*Math.PI*2;P(x+Math.cos(a)*24,y+Math.sin(a)*24,-Math.cos(a)*3,-Math.sin(a)*3,0.6,col,3);}}
+function spawnBerserkFX(x,y){for(let i=0;i<20;i++){const a=Math.random()*Math.PI*2;const sp=6*Math.random();P(x,y,Math.cos(a)*sp,Math.sin(a)*sp,0.5,"#ff5a5a",3);}}
+
+// ============================================================
+// メインアップデート
+// ============================================================
+const G={screen:"title",time:0,paused:false,gateOpen:false,menuSel:0,jobSel:0,help:false,gameoverReason:"",bagOpen:false};
+function update(dt){
+  G.time+=dt;
+  if(G.paused)return;
+  if(G.screen==="dungeon")updateDungeon(dt);
+  else if(G.screen==="town")updateTown(dt);
+  if(DUNGEON){
+    for(const pt of DUNGEON.particles){pt.x+=pt.vx;pt.y+=pt.vy;pt.vy+=0.05;pt.life-=dt;}
+    DUNGEON.particles=DUNGEON.particles.filter(function(p){return p.life>0;});
+    for(const f of DUNGEON.floats){f.y-=30*dt;f.life-=dt;}
+    DUNGEON.floats=DUNGEON.floats.filter(function(f){return f.life>0;});
+    if(DUNGEON.shake>0)DUNGEON.shake=Math.max(0,DUNGEON.shake-dt*30);
+  }
+}
+// マスム中心へピクセル位置を Tween
+function tweenEntities(dt){
+  const D=DUNGEON,k=Math.min(1,dt*16);
+  const p=D.player;
+  if(p){
+    p.x+=((p.tx+0.5)*TILE-p.x)*k;
+    p.y+=((p.ty+0.5)*TILE-p.y)*k;
+    if(p.swing>0)p.swing-=dt;
+    if(p.hitT>0)p.hitT-=dt;
+    p.animT+=dt;
+  }
+  for(const e of D.enemies){
+    e.x+=((e.tx+0.5)*TILE-e.x)*k;
+    e.y+=((e.ty+0.5)*TILE-e.y)*k;
+    if(e.hitT>0)e.hitT-=dt;
+    e.animT+=dt;
+  }
+  if(p&&p.summon){
+    const s=p.summon;
+    s.x+=((s.tx+0.5)*TILE-s.x)*k;
+    s.y+=((s.ty+0.5)*TILE-s.y)*k;
+    s.animT+=dt;
+  }
+}
+function updateDungeon(dt){
+  const D=DUNGEON;
+  if(!D||!D.player||G.screen!=="dungeon")return;
+  D.time+=dt;
+  if(TURN.phase==="player"){
+    // プレイヤーターン開始時に召喚獣が行動(敵フェーズ終了直後)
+    if(D._summonPending){
+      D._summonPending=false;
+      if(D.player.summon)summonAct(D.player.summon);
+    }
+  }
+  updateTurn(dt);
+}
+function nextFloor(){
+  const nf=DUNGEON.floor+1;
+  if(nf>100){G.screen="clear";return;}
+  enterFloor(nf,false);
+}
+function townActivate(t){
+  if(!t)return;
+  playSFX("sfx_click.ogg");
+  if(t.type==="shop")UI.openShop(t.id);
+  else if(t.type==="sell")UI.openSell();
+  else if(t.type==="inn")UI.openInn();
+  else if(t.type==="gate")openGateMenu(true);
+  else if(t.type==="down")startDungeon(1);
+}
+function updateTown(dt){
+  townPointer();
+  if(keyP("KeyZ","KeyJ","Enter","Space"))townActivate(TOWN.hover);
+  // 薬の素早い使用 (1,2,3)
+  if(keyP("Digit1"))quickUse("p_hp_s");
+  if(keyP("Digit2"))quickUse("p_hp_l");
+  if(keyP("Digit3"))quickUse("p_mp");
+}
+function quickUse(id){
+  const it=SAVE.inv.find(function(i){return i.id===id;});
+  if(!it||it.n<=0){UI.toast("所持していない");return false;}
+  const def=ALL_ITEMS[id];
+  const d=dStats();
+  if(def.hp){
+    if(SAVE.hp>=d.hpMax){UI.toast("HPは満タン");return false;}
+    SAVE.hp=Math.min(d.hpMax,SAVE.hp+def.hp);
+  }
+  if(def.mp){
+    if(SAVE.mp>=d.mpMax){UI.toast("MPは満タン");return false;}
+    SAVE.mp=Math.min(d.mpMax,SAVE.mp+def.mp);
+  }
+  it.n--;
+  if(it.n<=0)SAVE.inv.splice(SAVE.inv.indexOf(it),1);
+  playSFX("sfx_potion.ogg");
+  UI.float(W/2,H/2-40,"+ "+def.name,"#5aff8a",16);
+  return true;
+}
+
+// ============================================================
+// 地上(町)
+// ============================================================
+const TOWN={hover:null,shops:[]};
+function setupTown(){
+  TOWN.hover=null;
+  TOWN.shops=[
+    {id:"weapon",type:"shop",name:"武器屋「刃」",x:130,y:175,desc:"武器を販売・即装備"},
+    {id:"armor",type:"shop",name:"防具屋「盾」",x:340,y:175,desc:"防具を販売・即装備"},
+    {id:"ring",type:"shop",name:"指輪屋「環」",x:550,y:175,desc:"指輪を販売・即装備"},
+    {id:"summon",type:"shop",name:"召喚獣舎「獣」",x:760,y:175,desc:"召喚獣の購入・段階強化"},
+    {id:"sell",type:"sell",name:"古物商「宝」",x:235,y:340,desc:"アイテムを売却"},
+    {id:"inn",type:"inn",name:"宿屋「火」",x:445,y:340,desc:"全回復(100G)・セーブ"},
+    {id:"gate",type:"gate",name:"ワープゲート",x:655,y:340,desc:"訪れた階へ移動"},
+    {id:"down",type:"down",name:"ダンジョン入口",x:865,y:340,desc:"1Fから冒険"}
+  ];
+}
+let mouse={x:0,y:0,down:false};
+addEventListener("mousemove",function(e){mouse.x=e.clientX;mouse.y=e.clientY;});
+cv.addEventListener("click",function(){if(window.SUPCLICK){window.SUPCLICK=false;return;}mouse.down=true;});
+function townPointer(){
+  const r=cv.getBoundingClientRect();
+  const mx=(mouse.x-r.left)/r.width*W;
+  const my=(mouse.y-r.top)/r.height*H;
+  let best=null,bd=52;
+  for(const s of TOWN.shops){
+    const d=Math.hypot(mx-s.x,my-s.y);
+    if(d<bd){bd=d;best=s;}
+  }
+  TOWN.hover=best;
+}
+function startDungeon(f){
+  G.screen="dungeon";
+  G.gateOpen=false;
+  enterFloor(f,false);
+}
+
+// ============================================================
+// UI 状態とオーバーレイ
+// ============================================================
+const UI={
+  gate:null,shop:null,sell:null,flashLv:0,toastMsg:null,toastT:0,
+  toast:function(msg){this.toastMsg=msg;this.toastT=3;},
+  float:function(x,y,txt,col,size){
+    if(DUNGEON)DUNGEON.floats.push({x:x,y:y,txt:txt,col:col,size:size,life:1});
+    else if(G.screen==="town"){
+      if(!G._townFloats)G._townFloats=[];
+      G._townFloats.push({x:x,y:y,txt:txt,col:col,size:size,life:1});
+    }
+  },
+  togglePause:function(){
+    if(G.screen!=="dungeon"&&G.screen!=="town")return;
+    G.paused=!G.paused;
+    if(G.paused)stopBGM();
+    else if(G.screen==="dungeon"&&DUNGEON)playBGM(DUNGEON.floor===100?"bgm_boss.ogg":"bgm_dungeon.ogg");
+    else if(G.screen==="town")playBGM("bgm_town.ogg");
+  },
+  openShop:function(id){
+    if(id==="summon"){
+      UI.shop={open:true,mode:"summon",list:SUMMONS,sel:0,title:"召喚獣舎「獣」",
+        label:function(s){
+          const st=SAVE.summons[s.id]||0;
+          const cost=300+st*400;
+          return s.name+"  "+s.desc+"  段階"+st+"/10  (購入/強化 "+cost+"G)";
+        },
+        buy:function(s){
+          const st=SAVE.summons[s.id]||0;
+          const cost=300+st*400;
+          if(SAVE.gold<cost){UI.toast("金不足("+cost+"G必要)");return;}
+          if(st>=10){UI.toast("最大段階です");return;}
+          SAVE.summons[s.id]=st+1;
+          SAVE.gold-=cost;
+          storeSave();
+          playSFX("sfx_summon.ogg");
+          UI.toast(s.name+" が段階"+(st+1)+"に!");
+        }};
+      return;
+    }
+    let list,title;
+    if(id==="weapon"){list=WEAPONS;title="武器屋「刃」";}
+    else if(id==="armor"){list=ARMORS;title="防具屋「盾」";}
+    else{list=RINGS;title="指輪屋「環」";}
+    UI.shop={open:true,mode:id,list:list,sel:0,title:title,
+      label:function(item){
+        let s=item.name;
+        if(item.atk)s+="  攻+"+item.atk;
+        if(item.mag)s+="  魔+"+item.mag;
+        if(item.def)s+="  守+"+item.def;
+        if(item.spd)s+="  速+"+item.spd;
+        s+="  ("+item.price+"G)";
+        return s;
+      },
+      buy:function(item){
+        if(SAVE.gold<item.price){UI.toast("金不足");return;}
+        SAVE.gold-=item.price;
+        addItemEquip({kind:UI.shop.mode,id:item.id});
+        storeSave();
+        playSFX("sfx_shop.ogg");
+        UI.toast(item.name+" を購入・装備");
+      }};
+  },
+  openSell:function(){
+    UI.sell={open:true,sel:0};
+  },
+  sellItem:function(idx){
+    const it=SAVE.inv[idx];
+    if(!it)return;
+    const def=ALL_ITEMS[it.id];
+    if(!def){UI.toast("売れない");return;}
+    const price=Math.max(1,Math.floor((def.price||30)*0.5*it.n));
+    SAVE.gold+=price;
+    it.n--;
+    if(it.n<=0)SAVE.inv.splice(idx,1);
+    if(UI.sell.sel>=SAVE.inv.length)UI.sell.sel=Math.max(0,SAVE.inv.length-1);
+    storeSave();
+    playSFX("sfx_shop.ogg");
+    UI.toast(def.name+" を "+price+"G で売却");
+  },
+  openInn:function(){
+    if(SAVE.gold<100){UI.toast("金不足(100G必要)");return;}
+    SAVE.gold-=100;
+    const d=dStats();
+    SAVE.hp=d.hpMax;SAVE.mp=d.mpMax;
+    storeSave();
+    playSFX("sfx_potion.ogg");
+    playVoice("voice_shop.ogg");
+    UI.toast("ぐっすり眠った。全回復&セーブ");
+  }
+};
+function openGateMenu(fromTown){
+  const list=Object.keys(SAVE.floorsVisited).map(Number).sort(function(a,b){return a-b;});
+  UI.gate={open:true,fromTown:!!fromTown,list:list,sel:0};
+  playSFX("sfx_warp.ogg");
+}
+function gateSelect(){
+  const g=UI.gate;
+  if(!g.list.length)return;
+  const f=g.list[g.sel];
+  g.open=false;
+  G.gateOpen=false;
+  startDungeon(f);
+}
+function shopNav(dir){
+  if(UI.shop&&UI.shop.list.length){
+    UI.shop.sel=(UI.shop.sel+dir+UI.shop.list.length)%UI.shop.list.length;
+  }
+  if(UI.sell&&SAVE.inv.length){
+    UI.sell.sel=(UI.sell.sel+dir+SAVE.inv.length)%SAVE.inv.length;
+  }
+}
+function shopBuy(){
+  if(UI.shop&&UI.shop.list[UI.shop.sel])UI.shop.buy(UI.shop.list[UI.shop.sel]);
+  if(UI.sell)UI.sellItem(UI.sell.sel);
+}
+function closeOverlay(){
+  if(UI.shop){UI.shop=null;playSFX("sfx_click.ogg");}
+  if(UI.sell){UI.sell=null;playSFX("sfx_click.ogg");}
+  if(UI.gate){UI.gate=null;G.gateOpen=false;playSFX("sfx_click.ogg");}
+}
+// 装備・アイテム整理 (Tab/I) — ターン消費しない
+function toggleBag(){
+  if(UI.bag){closeBag();return;}
+  UI.bag={open:true,sel:0};
+  playSFX("sfx_click.ogg");
+}
+function closeBag(){
+  UI.bag=null;
+  playSFX("sfx_click.ogg");
+}
+function bagNav(dir){
+  if(!UI.bag)return;
+  const n=SAVE.inv.length;
+  if(!n)return;
+  UI.bag.sel=(UI.bag.sel+dir+n)%n;
+  playSFX("sfx_click.ogg",1.1);
+}
+function bagConfirm(){
+  if(!UI.bag)return;
+  const it=SAVE.inv[UI.bag.sel];
+  if(!it)return;
+  const def=ALL_ITEMS[it.id];
+  if(itemSlotOf(def)){
+    equipFromBag(UI.bag.sel);
+    storeSave();
+    playSFX("sfx_shop.ogg");
+  }else{
+    if(quickUse(it.id))storeSave();
+  }
+  if(UI.bag.sel>=SAVE.inv.length)UI.bag.sel=Math.max(0,SAVE.inv.length-1);
+}
+function bagSell(){
+  if(!UI.bag)return;
+  const it=SAVE.inv[UI.bag.sel];
+  if(!it)return;
+  const def=ALL_ITEMS[it.id];
+  const price=Math.max(1,Math.floor((def.price||30)*0.5*it.n));
+  SAVE.gold+=price;
+  it.n--;
+  if(it.n<=0)SAVE.inv.splice(UI.bag.sel,1);
+  if(UI.bag.sel>=SAVE.inv.length)UI.bag.sel=Math.max(0,SAVE.inv.length-1);
+  storeSave();
+  playSFX("sfx_shop.ogg");
+  UI.toast(def.name+" を "+price+"G で売却");
+}
+function bagInput(){
+  if(!UI.bag)return;
+  if(keyR("ArrowUp","KeyW"))bagNav(-1);
+  if(keyR("ArrowDown","KeyS"))bagNav(1);
+  if(keyP("KeyZ","KeyJ","Enter"))bagConfirm();
+  if(keyP("KeyX","KeyL"))bagSell();
+  if(keyP("Escape","Tab","KeyI"))closeBag();
+}
+// タイトル
+function titleNav(dir){G.menuSel=(G.menuSel+dir+3)%3;}
+function titleConfirm(){
+  playSFX("sfx_click.ogg");
+  if(G.menuSel===0){
+    G.screen="job";
+    G.jobSel=0;
+  }else if(G.menuSel===1){
+    if(SAVE){
+      G.screen="town";
+      setupTown();
+      playBGM("bgm_town.ogg");
+      UI.toast("ようこそ、"+JOBS[SAVE.job].name+"。準備はいいか?");
+    }else UI.toast("セーブデータなし");
+  }else{
+    G.help=true;
+  }
+}
+function jobNav(dir){
+  const n=Object.keys(JOBS).length;
+  G.jobSel=(G.jobSel+dir+n)%n;
+  playSFX("sfx_click.ogg",1.2);
+}
+function jobConfirm(){
+  playSFX("sfx_click.ogg");
+  startRun(Object.keys(JOBS)[G.jobSel]);
+}
+function startRun(jobId){
+  SAVE=newSave(jobId);
+  storeSave();
+  G.screen="town";
+  setupTown();
+  playBGM("bgm_town.ogg");
+  UI.toast("準備はいいか? ダンジョン入口から降りろ");
+}
+
+// ============================================================
+// 描画
+// ============================================================
+function img(name,x,y,w,h,fb){
+  const im=IMG[name];
+  if(im&&im._ok)ctx.drawImage(im,x,y,w,h);
+  else if(fb){
+    ctx.fillStyle=fb;
+    ctx.beginPath();ctx.arc(x+w/2,y+h/2,Math.min(w,h)/2.4,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle="rgba(0,0,0,.4)";ctx.stroke();
+  }
+}
+function panel(x,y,w,h,hi){
+  ctx.fillStyle=hi?"rgba(70,52,24,.93)":"rgba(28,25,20,.88)";
+  ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle=hi?"#ffd24a":"#6a5a30";
+  ctx.lineWidth=hi?2:1;
+  ctx.strokeRect(x+2,y+2,w-4,h-4);
+  ctx.fillStyle=hi?"#ffd24a":"#6a5a30";
+  ctx.fillRect(x,y,8,2);ctx.fillRect(x,y,2,8);
+  ctx.fillRect(x+w-8,y,8,2);ctx.fillRect(x+w-2,y,2,8);
+  ctx.fillRect(x,y+h-2,8,2);ctx.fillRect(x,y+h-8,2,8);
+  ctx.fillRect(x+w-8,y+h-2,8,2);ctx.fillRect(x+w-2,y+h-8,2,8);
+}
+function wrapText(txt,x,y,mw,lh){
+  let line="",yy=y;
+  for(const ch of txt){
+    if(ctx.measureText(line+ch).width>mw){ctx.fillText(line,x,yy);line=ch;yy+=lh;}
+    else line+=ch;
+  }
+  if(line)ctx.fillText(line,x,yy);
+}
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  if(G.screen==="title")drawTitle();
+  else if(G.screen==="job")drawJobSelect();
+  else if(G.screen==="town")drawTown();
+  else if(G.screen==="dungeon")drawDungeon();
+  else if(G.screen==="gameover")drawGameOver();
+  else if(G.screen==="clear")drawClear();
+  drawHUD();
+  drawOverlays();
+  drawToast();
+  if(G.paused)drawPause();
+}
+function drawTitle(){
+  img("bg_title.png",0,0,W,H,"#0a0a14");
+  ctx.fillStyle="rgba(5,5,10,.35)";ctx.fillRect(0,0,W,H);
+  ctx.save();
+  ctx.textAlign="center";
+  ctx.shadowColor="#ffb020";ctx.shadowBlur=24;
+  ctx.fillStyle="#ffd97a";
+  ctx.font="bold 56px serif";
+  ctx.fillText("伝説の唐揚げダンジョン",W/2,140);
+  ctx.shadowBlur=0;
+  ctx.fillStyle="#e8d9a0";ctx.font="16px sans-serif";
+  ctx.fillText("〜 100階の深淵から、黄金の唐揚げを取り戻せ 〜",W/2,178);
+  ctx.restore();
+  ctx.textAlign="center";
+  for(let i=0;i<3;i++){
+    const y=300+i*46;
+    const sel=G.menuSel===i;
+    ctx.fillStyle=sel?"rgba(255,190,60,.95)":"rgba(232,217,160,.8)";
+    ctx.font=(sel?"bold ":"")+"22px sans-serif";
+    ctx.fillText((sel?"▶ ":"")+["新しい冒険","続ける(セーブあり)","操作説明"][i],W/2,y);
+  }
+  ctx.fillStyle="rgba(200,190,150,.55)";ctx.font="13px sans-serif";
+  ctx.fillText("↑↓:選択  Z/Enter:決定   難易度: 高",W/2,462);
+  if(SAVE)ctx.fillText("セーブ: "+JOBS[SAVE.job].name+" Lv."+SAVE.lv+" / 最深 "+SAVE.maxFloor+"F"+(SAVE.cleared?" / クリア済":""),W/2,488);
+  // タイトル入力
+  if(keyP("ArrowUp","KeyW"))titleNav(-1);
+  if(keyP("ArrowDown","KeyS"))titleNav(1);
+  if(keyP("KeyZ","Enter"))titleConfirm();
+}
+function drawJobSelect(){
+  img("bg_title.png",0,0,W,H,"#0a0a14");
+  ctx.fillStyle="rgba(5,5,10,.62)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 30px serif";
+  ctx.fillText("主人公のJOBを選べ",W/2,56);
+  const jobs=Object.keys(JOBS);
+  for(let i=0;i<jobs.length;i++){
+    const j=JOBS[jobs[i]];
+    const x=68+i*172,y=92;
+    const sel=G.jobSel===i;
+    panel(x,y,158,340,sel);
+    img(jobs[i]+".png",x+39,y+18,80,80,"#555");
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font="bold 19px sans-serif";
+    ctx.fillText(j.name,x+79,y+128);
+    ctx.fillStyle="rgba(230,220,180,.78)";ctx.font="11px sans-serif";
+    wrapText(j.desc,x+79,y+150,140,15);
+    ctx.fillStyle="rgba(150,150,150,.65)";ctx.font="11px sans-serif";
+    ctx.fillText("HP"+j.base.hp+" 攻"+j.base.atk+" 魔"+j.base.mag,x+79,y+262);
+    ctx.fillText("守"+j.base.def+" 速"+j.base.spd,x+79,y+280);
+    ctx.fillStyle="rgba(120,120,140,.6)";ctx.font="10px sans-serif";
+    wrapText(j.skills.map(function(s){return s.name;}).join(" / "),x+79,y+304,140,13);
+  }
+  ctx.fillStyle="rgba(200,190,150,.7)";ctx.font="14px sans-serif";
+  ctx.fillText("← → で選択  Z/Enter で決定",W/2,478);
+  if(keyP("ArrowLeft","KeyA"))jobNav(-1);
+  if(keyP("ArrowRight","KeyD"))jobNav(1);
+  if(keyP("KeyZ","Enter"))jobConfirm();
+}
+function drawTown(){
+  img("bg_town.png",0,0,W,H,"#1a1420");
+  ctx.fillStyle="rgba(10,8,14,.25)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 26px serif";
+  ctx.fillText("〜 地上: 旅の始まりの町 〜",W/2,48);
+  ctx.fillStyle="#ffd24a";ctx.font="bold 17px sans-serif";
+  ctx.fillText("所持金: "+SAVE.gold+"G",W/2,76);
+  for(const s of TOWN.shops){
+    const sel=TOWN.hover===s;
+    panel(s.x-98,s.y-58,196,112,sel);
+    const ic=s.type==="shop"?(s.id==="weapon"?"icon_sword.png":s.id==="armor"?"icon_plate.png":s.id==="ring"?"icon_ring_atk.png":"icon_summonmat.png"):(s.type==="sell"?"icon_gold.png":s.type==="inn"?"icon_potion_s.png":s.type==="gate"?"gate.png":"stairs.png");
+    img(ic,s.x-78,s.y-40,36,36,"#665");
+    ctx.textAlign="left";
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font="bold 16px sans-serif";
+    ctx.fillText(s.name,s.x-34,s.y-26);
+    ctx.fillStyle="rgba(220,210,170,.72)";ctx.font="11px sans-serif";
+    ctx.fillText(s.desc,s.x-34,s.y-2);
+  }
+  ctx.textAlign="center";
+  ctx.fillStyle="rgba(200,190,150,.6)";ctx.font="13px sans-serif";
+  ctx.fillText("マウスで選択  クリック/Z で利用   1/2/3: 薬・エーテル   P: ポーズ",W/2,506);
+  ctx.textAlign="left";ctx.fillStyle="rgba(200,190,150,.6)";ctx.font="12px sans-serif";
+  const we=SAVE.equip.weapon?ALL_ITEMS[SAVE.equip.weapon].name:"なし";
+  const ar=SAVE.equip.armor?ALL_ITEMS[SAVE.equip.armor].name:"なし";
+  const rg=SAVE.equip.ring?ALL_ITEMS[SAVE.equip.ring].name:"なし";
+  ctx.fillText("Lv."+SAVE.lv+"  武器:"+we+"  防具:"+ar+"  指輪:"+rg,18,526);
+  // クリック
+  if(mouse.down)townActivate(TOWN.hover);
+  mouse.down=false;
+  // 町のフロート
+  if(G._townFloats){
+    for(const f of G._townFloats){f.y-=30/60;f.life-=1/60;}
+    G._townFloats=G._townFloats.filter(function(f){return f.life>0;});
+    ctx.textAlign="center";
+    for(const f of G._townFloats){
+      ctx.globalAlpha=Math.min(1,f.life*2);
+      ctx.fillStyle=f.col;ctx.font="bold "+(f.size||14)+"px sans-serif";
+      ctx.fillText(f.txt,f.x,f.y);
+    }
+    ctx.globalAlpha=1;
+  }
+}
+const ZOOM=1.5;
+function dirAngle(di){
+  const v=DIRS[di];
+  return Math.atan2(v[1],v[0]);
+}
+function drawDungeon(){
+  const D=DUNGEON;
+  if(!D)return;
+  const P=D.player;
+  const viewW=W/ZOOM,viewH=H/ZOOM;
+  const camX=Math.max(0,Math.min(MW*TILE-viewW,P.x-viewW/2));
+  const camY=Math.max(0,Math.min(MH*TILE-viewH,P.y-viewH/2));
+  ctx.save();
+  const shx=(Math.random()-0.5)*D.shake,shy=(Math.random()-0.5)*D.shake;
+  ctx.translate(-camX*ZOOM+shx,-camY*ZOOM+shy);
+  ctx.scale(ZOOM,ZOOM);
+  const th=D.theme;
+  const floorIm=IMG[th.floor];
+  const wallIm=IMG["tile_wall.png"];
+  const x0=Math.floor(camX/TILE),y0=Math.floor(camY/TILE);
+  const x1=Math.min(MW,Math.ceil((camX+viewW)/TILE)+1);
+  const y1=Math.min(MH,Math.ceil((camY+viewH)/TILE)+1);
+  for(let y=y0;y<y1;y++){
+    for(let x=x0;x<x1;x++){
+      const px=x*TILE,py=y*TILE;
+      if(MAP.grid[y][x]===FLOOR){
+        if(floorIm&&floorIm._ok)ctx.drawImage(floorIm,px,py,TILE,TILE);
+        else{
+          ctx.fillStyle=(x+y)%2?"#4a4436":"#423c30";
+          ctx.fillRect(px,py,TILE,TILE);
+        }
+        // 床をわずかに明るく(壁との明度差)
+        ctx.fillStyle="rgba(255,240,200,.07)";
+        ctx.fillRect(px,py,TILE,TILE);
+      }else{
+        if(wallIm&&wallIm._ok)ctx.drawImage(wallIm,px,py,TILE,TILE);
+        else{
+          ctx.fillStyle="#17140f";ctx.fillRect(px,py,TILE,TILE);
+        }
+        // 壁を暗く+上エッジにハイライト(立体感と境界明確化)
+        ctx.fillStyle="rgba(0,0,0,.42)";
+        ctx.fillRect(px,py,TILE,TILE);
+        ctx.fillStyle="rgba(255,255,255,.12)";
+        ctx.fillRect(px,py,TILE,3);
+        ctx.fillStyle="rgba(0,0,0,.55)";
+        ctx.fillRect(px,py+TILE-4,TILE,4);
+      }
+    }
+  }
+  ctx.fillStyle=th.tint;ctx.globalAlpha=0.14;
+  ctx.fillRect(camX,camY,viewW,viewH);
+  ctx.globalAlpha=1;
+  // 突進警告(赤い経路)
+  const t=G.time;
+  for(const w of D.warnings){
+    const a=0.25+0.2*Math.sin(t*10);
+    for(const c of w.path){
+      ctx.fillStyle="rgba(255,70,50,"+a+")";
+      ctx.fillRect(c.x*TILE+2,c.y*TILE+2,TILE-4,TILE-4);
+    }
+  }
+  // 出口
+  img("stairs.png",MAP.exit.x*TILE-4,MAP.exit.y*TILE-4,40,40,"#444");
+  if(MAP.gate)drawGateSprite(MAP.gate);
+  if(MAP.savept)drawSavepointSprite(MAP.savept);
+  for(const dr of D.drops)drawDrop(dr);
+  for(const c of D.chests){if(!c.open)img("chest.png",c.tx*TILE+TILE/2-14,c.ty*TILE+TILE/2-14,28,28,"#8a6a30");}
+  for(const e of D.enemies)drawEnemy(e);
+  if(P.summon)drawSummonSprite(P.summon);
+  drawPlayer(P);
+  // 敵弾(マスム中心)
+  for(const b of D.ebullets){
+    const bx=(b.tx+0.5)*TILE,by=(b.ty+0.5)*TILE;
+    ctx.fillStyle="rgba(0,0,0,.4)";
+    ctx.beginPath();ctx.arc(bx,by,9,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle=b.col||"#c84a4a";
+    ctx.beginPath();ctx.arc(bx,by,6,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="rgba(255,255,255,.8)";
+    ctx.beginPath();ctx.arc(bx,by,2.5,0,Math.PI*2);ctx.fill();
+  }
+  for(const pt of D.particles){
+    ctx.globalAlpha=Math.max(0,Math.min(1,pt.life*2.5));
+    ctx.fillStyle=pt.col;
+    if(pt.bolt)ctx.fillRect(pt.x-2,pt.y-44,4,44);
+    else{ctx.beginPath();ctx.arc(pt.x,pt.y,pt.r,0,Math.PI*2);ctx.fill();}
+  }
+  ctx.globalAlpha=1;
+  ctx.textAlign="center";
+  for(const f of D.floats){
+    ctx.globalAlpha=Math.min(1,f.life*2);
+    ctx.fillStyle=f.col;
+    ctx.font="bold "+(f.size||14)+"px sans-serif";
+    ctx.fillText(f.txt,f.x,f.y);
+  }
+  ctx.globalAlpha=1;
+  ctx.restore();
+  // スクリーン空間: HUD情報
+  ctx.textAlign="left";
+  ctx.fillStyle="rgba(255,215,122,.85)";ctx.font="bold 16px sans-serif";
+  ctx.fillText(D.floor+"F  "+D.theme.name,14,24);
+  ctx.fillStyle="rgba(200,190,150,.6)";ctx.font="12px sans-serif";
+  ctx.fillText("ターン "+D.turn,14,42);
+  if(TURN.phase!=="player"){
+    ctx.fillStyle="rgba(126,200,255,.7)";
+    ctx.fillText(TURN.phase==="enemy"?"敵のターン…":"",14,58);
+  }
+  // ボスHPバー
+  for(const e of D.enemies){
+    if(e.id==="boss_karaage"&&!e.dead){
+      ctx.fillStyle="rgba(0,0,0,.7)";
+      ctx.fillRect(W/2-250,H-42,500,14);
+      ctx.fillStyle="#e8942e";
+      ctx.fillRect(W/2-248,H-40,496*Math.max(0,e.hp/e.hpMax),10);
+      ctx.fillStyle="#ffd97a";ctx.font="bold 14px sans-serif";ctx.textAlign="center";
+      ctx.fillText("唐揚げ魔王",W/2,H-48);
+      break;
+    }
+  }
+}
+function drawGateSprite(g){
+  const px=g.x*TILE,py=g.y*TILE;
+  const t=G.time;
+  img("gate.png",px-6,py-10,44,52,"#6a4a9a");
+  ctx.fillStyle="rgba(160,110,255,"+(0.4+0.3*Math.sin(t*4))+")";
+  ctx.beginPath();ctx.ellipse(px+16,py+16,10,16,0,0,Math.PI*2);ctx.fill();
+}
+function drawSavepointSprite(g){
+  const px=g.x*TILE,py=g.y*TILE;
+  const t=G.time;
+  img("savepoint.png",px-4,py-6,40,44,"#c8a04a");
+  ctx.fillStyle="rgba(255,230,140,"+(0.3+0.3*Math.sin(t*3))+")";
+  ctx.beginPath();ctx.arc(px+16,py+8,6,0,Math.PI*2);ctx.fill();
+}
+function drawDrop(dr){
+  const yy=dr.y+Math.sin(dr.bob)*3;
+  if(dr.id==="gold")img("icon_gold.png",dr.x-10,yy-10,20,20,"#ffd24a");
+  else if(dr.id==="exp")img("icon_exp.png",dr.x-9,yy-9,18,18,"#7ec8ff");
+  else{
+    const it=ALL_ITEMS[dr.id];
+    if(it)img(it.img,dr.x-10,yy-10,20,20,"#8a5a5a");
+  }
+}
+// スプライト描画: 待機=1フレーム+バウンド / 移動=2フレーム切替
+function spriteFrame(base,walkId,moving){
+  if(moving&&walkId&&IMG[walkId]&&IMG[walkId]._ok&&Math.floor(G.time*9)%2===1)return IMG[walkId];
+  return IMG[base];
+}
+function drawEnemy(e){
+  const s=e.size/2;
+  const bob=Math.sin(G.time*3+e.animT*2)*2;
+  const flash=e.hitT>0;
+  ctx.save();
+  ctx.translate(e.x,e.y+bob);
+  if(e.freezeT>0){
+    ctx.fillStyle="rgba(150,220,255,.35)";
+    ctx.beginPath();ctx.arc(0,0,e.r+5,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="rgba(220,245,255,.9)";ctx.font="bold 12px sans-serif";ctx.textAlign="center";
+    ctx.fillText("❄",0,-e.r-8);
+  }
+  ctx.fillStyle="rgba(0,0,0,.35)";
+  ctx.beginPath();ctx.ellipse(0,e.r*0.7,e.r*0.8,e.r*0.35,0,0,Math.PI*2);ctx.fill();
+  const isBoss=e.id==="boss_karaage";
+  const moving=Math.hypot((e.tx+0.5)*TILE-e.x,(e.ty+0.5)*TILE-e.y)>2;
+  const im=spriteFrame(e.id+".png",e.id+"_walk.png",moving);
+  if(im&&im._ok){
+    const flip=DIRS[e.dirIdx][0]<0?-1:1;
+    const sc=isBoss?1.6:1;
+    if(flash)ctx.filter="brightness(2.5)";
+    ctx.scale(flip*sc,sc);
+    ctx.drawImage(im,-s/2,-s/2,s,s);
+    ctx.filter="none";
+  }else{
+    ctx.fillStyle=flash?"#fff":e.col;
+    ctx.beginPath();ctx.arc(0,0,e.r,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="rgba(0,0,0,.5)";
+    ctx.beginPath();ctx.arc(-e.r*0.3,-2,2.5,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(e.r*0.3,-2,2.5,0,Math.PI*2);ctx.fill();
+  }
+  ctx.restore();
+  if(e.hp<e.hpMax&&!isBoss){
+    const w=e.r*2;
+    ctx.fillStyle="rgba(0,0,0,.6)";
+    ctx.fillRect(e.x-w/2,e.y-e.r-10,w,4);
+    ctx.fillStyle="#e04040";
+    ctx.fillRect(e.x-w/2,e.y-e.r-10,w*Math.max(0,e.hp/e.hpMax),4);
+  }
+  if(e.chargeWarn){
+    ctx.fillStyle="rgba(255,90,60,.95)";ctx.font="bold 13px sans-serif";ctx.textAlign="center";
+    ctx.fillText("⚠突進",e.x,e.y-e.r-16);
+  }
+}
+function drawSummonSprite(s){
+  const t=G.time;
+  ctx.save();
+  ctx.translate(s.x,s.y+Math.sin(t*5)*3);
+  const sdef=SUMMON_BY[s.id];
+  const scale=0.8+s.stage*0.06;
+  const moving=Math.hypot((s.tx+0.5)*TILE-s.x,(s.ty+0.5)*TILE-s.y)>2;
+  const im=spriteFrame(sdef.img,sdef.img.replace(".png","_walk.png"),moving);
+  if(im&&im._ok){
+    const flip=DIRS[s.dirIdx][0]<0?-1:1;
+    ctx.scale(flip*scale,scale);
+    ctx.drawImage(im,-32,-32,64,64);
+  }else{
+    ctx.fillStyle=sdef.col;
+    ctx.beginPath();ctx.arc(0,0,12*scale,0,Math.PI*2);ctx.fill();
+  }
+  if(s.atkBuffT>0){
+    ctx.strokeStyle="rgba(255,210,90,"+(0.5+0.4*Math.sin(t*8))+")";
+    ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(0,0,26*scale,0,Math.PI*2);ctx.stroke();
+  }
+  ctx.restore();
+  ctx.fillStyle="rgba(255,255,255,.55)";ctx.font="10px sans-serif";ctx.textAlign="center";
+  ctx.fillText("Lv"+s.stage,s.x,s.y-22);
+}
+function drawPlayer(P){
+  const t=G.time;
+  const ang=dirAngle(P.dirIdx);
+  const v=DIRS[P.dirIdx];
+  const moving=Math.hypot((P.tx+0.5)*TILE-P.x,(P.ty+0.5)*TILE-P.y)>2;
+  const bob=moving?Math.sin(t*16)*2:Math.sin(t*3)*1.5;
+  const flash=P.hitT>0;
+  ctx.save();
+  // 向いているマスのハイライト(世界座標: 常に正確な対象マス)
+  ctx.fillStyle="rgba(255,210,90,.10)";
+  ctx.fillRect((P.tx+v[0])*TILE+3,(P.ty+v[1])*TILE+3,TILE-6,TILE-6);
+  ctx.translate(P.x,P.y);
+  ctx.fillStyle="rgba(0,0,0,.35)";
+  ctx.beginPath();ctx.ellipse(0,10,12,5,0,0,Math.PI*2);ctx.fill();
+  const im=spriteFrame(SAVE.job+".png",SAVE.job+"_walk.png",moving);
+  const s=34;
+  if(im&&im._ok){
+    const flip=DIRS[P.dirIdx][0]<0?-1:1;
+    ctx.save();
+    if(flash)ctx.filter="brightness(0.6)";
+    ctx.translate(0,bob);
+    ctx.scale(flip,1);
+    ctx.drawImage(im,-s/2,-s/2,s,s);
+    ctx.restore();
+  }else{
+    ctx.save();
+    ctx.translate(0,bob);
+    ctx.fillStyle=flash?"#fff":"#5a8ad0";
+    ctx.beginPath();ctx.arc(0,0,13,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+  }
+  // 向きを示す矢印(スプライトのscale空間の外で描画)
+  ctx.rotate(ang);
+  ctx.fillStyle="rgba(255,215,122,.8)";
+  ctx.beginPath();
+  ctx.moveTo(26,0);ctx.lineTo(19,-5);ctx.lineTo(19,5);
+  ctx.closePath();ctx.fill();
+  ctx.rotate(-ang);
+  if(P.swing>0){
+    const prog=1-P.swing/0.22;
+    const a=ang-1.2+prog*2.4;
+    ctx.strokeStyle="rgba(255,255,255,.85)";
+    ctx.lineWidth=4;
+    ctx.beginPath();ctx.arc(0,bob,24,a-0.5,a+0.5);ctx.stroke();
+  }
+  ctx.restore();
+  if(P.guardT>0){
+    ctx.strokeStyle="rgba(140,230,255,"+(0.4+0.4*Math.sin(t*10))+")";
+    ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(P.x,P.y,22,0,Math.PI*2);ctx.stroke();
+  }
+  if(P.dashBonusT>0){
+    ctx.fillStyle="rgba(255,90,90,"+(0.2+0.2*Math.sin(t*12))+")";
+    ctx.beginPath();ctx.arc(P.x,P.y,20,0,Math.PI*2);ctx.fill();
+  }
+}
+function drawHUD(){
+  if(G.screen!=="dungeon"&&G.screen!=="town")return;
+  if(!SAVE)return;
+  const d=dStats();
+  ctx.fillStyle="rgba(12,10,8,.72)";
+  ctx.fillRect(8,8,252,88);
+  ctx.strokeStyle="#6a5a30";ctx.strokeRect(8,8,252,88);
+  img(SAVE.job+".png",14,14,52,52,"#556");
+  ctx.textAlign="left";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 14px sans-serif";
+  ctx.fillText(JOBS[SAVE.job].name+"  Lv."+SAVE.lv,74,28);
+  ctx.fillStyle="#8a2a2a";ctx.fillRect(74,36,172,10);
+  ctx.fillStyle="#e04040";ctx.fillRect(74,36,172*Math.max(0,Math.min(1,SAVE.hp/d.hpMax)),10);
+  ctx.fillStyle="#fff";ctx.font="10px sans-serif";
+  ctx.fillText("HP "+Math.ceil(SAVE.hp)+"/"+d.hpMax,78,44);
+  ctx.fillStyle="#2a2a6a";ctx.fillRect(74,50,172,10);
+  ctx.fillStyle="#4a6ae0";ctx.fillRect(74,50,172*Math.max(0,Math.min(1,SAVE.mp/d.mpMax)),10);
+  ctx.fillText("MP "+Math.ceil(SAVE.mp)+"/"+d.mpMax,78,58);
+  ctx.fillStyle="#222";ctx.fillRect(74,64,172,6);
+  ctx.fillStyle="#7ec8ff";ctx.fillRect(74,64,172*Math.min(1,SAVE.xp/xpNeed(SAVE.lv)),6);
+  const skills=JOBS[SAVE.job].skills;
+  const keys=["Z","X","C"];
+  for(let i=0;i<3;i++){
+    const x=74+i*58,y=74;
+    const p=DUNGEON?DUNGEON.player:null;
+    const cd=p?p.skillCd[i]:0;
+    ctx.fillStyle="rgba(40,35,25,.9)";ctx.fillRect(x,y,54,14);
+    ctx.strokeStyle="#6a5a30";ctx.strokeRect(x,y,54,14);
+    ctx.fillStyle=cd>0?"#888":"#ffd97a";ctx.font="9px sans-serif";
+    ctx.fillText(keys[i]+" "+skills[i].name.slice(0,4),x+3,y+10);
+    if(cd>0){ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(x,y,54*(cd/skills[i].cd),14);}
+  }
+  ctx.textAlign="right";
+  ctx.fillStyle="#ffd24a";ctx.font="bold 15px sans-serif";
+  ctx.fillText(SAVE.gold+"G",W-14,26);
+  if(G.screen==="dungeon"&&DUNGEON){
+    ctx.fillStyle="#e8d9a0";ctx.font="13px sans-serif";
+    ctx.fillText("最深記録 "+SAVE.maxFloor+"F",W-14,46);
+  }
+  ctx.textAlign="left";
+  ctx.fillStyle="rgba(200,190,150,.7)";ctx.font="11px sans-serif";
+  const we=SAVE.equip.weapon?ALL_ITEMS[SAVE.equip.weapon].name:"-";
+  const ar=SAVE.equip.armor?ALL_ITEMS[SAVE.equip.armor].name:"-";
+  ctx.fillText("武:"+we+"  防:"+ar,8,106);
+}
+function drawOverlays(){
+  if(UI.bag){drawBag();return;}
+  if(UI.gate&&UI.gate.open)drawGateMenu();
+  else if(UI.shop)drawShop();
+  else if(UI.sell)drawSellMenu();
+  if(G.help)drawHelp();
+}
+function drawBag(){
+  bagInput();
+  const b=UI.bag;
+  ctx.fillStyle="rgba(0,0,0,.68)";ctx.fillRect(0,0,W,H);
+  panel(W/2-330,30,660,480,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 24px serif";
+  ctx.fillText("装備・アイテム",W/2,68);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("↑↓ 選択    Z: 装備/使用    X: 売却(半額)    Esc/I/Tab: 閉じる    (ターンは消費しない)",W/2,92);
+  // 現在装備
+  const slots=[["武器",SAVE.equip.weapon],["防具",SAVE.equip.armor],["指輪",SAVE.equip.ring]];
+  for(let i=0;i<3;i++){
+    const x=W/2-306+i*205,y=106;
+    const label=slots[i][0],id=slots[i][1];
+    panel(x,y,195,92,false);
+    const it=id?ALL_ITEMS[id]:null;
+    ctx.textAlign="left";
+    ctx.fillStyle="#c8b070";ctx.font="bold 12px sans-serif";
+    ctx.fillText(label,x+12,y+22);
+    ctx.fillStyle=it?"#ffd97a":"#777";ctx.font="bold 14px sans-serif";
+    ctx.fillText(it?it.name:"なし",x+12,y+46);
+    if(it){
+      ctx.fillStyle="rgba(220,210,170,.85)";ctx.font="11px sans-serif";
+      let st="";
+      if(it.atk)st+=" 攻+"+it.atk;
+      if(it.mag)st+=" 魔+"+it.mag;
+      if(it.def)st+=" 守+"+it.def;
+      if(it.spd)st+=" 速+"+it.spd;
+      ctx.fillText(st,x+12,y+68);
+    }
+  }
+  // バッグ
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="bold 13px sans-serif";ctx.textAlign="left";
+  ctx.fillText("所持品 ("+SAVE.inv.length+")   所持金 "+SAVE.gold+"G",W/2-306,222);
+  if(!SAVE.inv.length){
+    ctx.fillStyle="#888";ctx.textAlign="center";ctx.font="14px sans-serif";
+    ctx.fillText("何もない",W/2,320);
+  }
+  for(let i=0;i<SAVE.inv.length;i++){
+    const y=232+i*34;
+    if(y>470)break;
+    const it=SAVE.inv[i];
+    const def=ALL_ITEMS[it.id];
+    if(!def)continue;
+    const sel=b.sel===i;
+    panel(W/2-306,y,612,30,sel);
+    const slotName=itemSlotOf(def)?{weapon:"武",armor:"防",ring:"輪"}[itemSlotOf(def)]:"消";
+    ctx.textAlign="left";
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";
+    ctx.font=(sel?"bold ":"")+"13px sans-serif";
+    ctx.fillText("["+slotName+"] "+def.name+" ×"+it.n,W/2-292,y+20);
+    if(sel&&def.desc){
+      ctx.fillStyle="rgba(200,190,150,.7)";ctx.font="11px sans-serif";
+      ctx.fillText(def.desc,W/2+60,y+20);
+    }
+    if(def.img)img(def.img,W/2+272,y+3,24,24,"#665");
+  }
+}
+function drawGateMenu(){
+  const g=UI.gate;
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(0,0,W,H);
+  panel(W/2-270,50,540,440,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#c8a0ff";ctx.font="bold 24px serif";
+  ctx.fillText("ワープゲート",W/2,92);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("訪れた階を選択  ← → 選択  Z:移動  X:戻る",W/2,118);
+  const cols=4;
+  for(let i=0;i<g.list.length;i++){
+    const c=i%cols,r=Math.floor(i/cols);
+    if(r>6)break;
+    const x=W/2-270+28+c*128,y=140+r*54;
+    const sel=g.sel===i;
+    panel(x,y,112,44,sel);
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font="bold 18px sans-serif";
+    ctx.fillText(g.list[i]+"F",x+56,y+28);
+  }
+  if(!g.list.length){ctx.fillStyle="#888";ctx.font="14px sans-serif";ctx.fillText("まだ訪れた階がない",W/2,300);}
+  if(key("ArrowLeft","KeyA")&&!G._g1){G._g1=true;if(g.list.length){g.sel=(g.sel-1+g.list.length)%g.list.length;playSFX("sfx_click.ogg",1.1);}}
+  if(!key("ArrowLeft","KeyA"))G._g1=false;
+  if(key("ArrowRight","KeyD")&&!G._g2){G._g2=true;if(g.list.length){g.sel=(g.sel+1)%g.list.length;playSFX("sfx_click.ogg",1.1);}}
+  if(!key("ArrowRight","KeyD"))G._g2=false;
+  if(keyP("KeyZ","Enter"))gateSelect();
+  if(keyP("KeyX","Escape"))closeOverlay();
+}
+function drawShop(){
+  const s=UI.shop;
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(0,0,W,H);
+  panel(W/2-310,50,620,440,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 24px serif";
+  ctx.fillText(s.title,W/2,88);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("← → 選択  Z:購入  X:閉じる   所持金 "+SAVE.gold+"G",W/2,112);
+  for(let i=0;i<s.list.length;i++){
+    const y=136+i*40;
+    if(y>462)break;
+    const sel=s.sel===i;
+    panel(W/2-280,y,560,34,sel);
+    ctx.textAlign="left";
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";
+    ctx.font=(sel?"bold ":"")+"14px sans-serif";
+    wrapLine(s.label(s.list[i]),W/2-264,y+22,480);
+    const it=s.list[i];
+    if(it.img)img(it.img,W/2+232,y+3,28,28,"#665");
+  }
+  if(keyR("ArrowUp","KeyW")){shopNav(-1);playSFX("sfx_click.ogg",1.1);}
+  if(keyR("ArrowDown","KeyS")){shopNav(1);playSFX("sfx_click.ogg",1.1);}
+  if(keyP("KeyZ","Enter"))shopBuy();
+  if(keyP("KeyX","Escape"))closeOverlay();
+}
+function wrapLine(txt,x,y,mw){
+  ctx.save();
+  ctx.textAlign="left";
+  ctx.fillText(txt,x,y);
+  ctx.restore();
+}
+function drawSellMenu(){
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(0,0,W,H);
+  panel(W/2-310,50,620,440,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 24px serif";
+  ctx.fillText("古物商「宝」— 売却",W/2,88);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("← → 選択  Z:売却  X:閉じる   所持金 "+SAVE.gold+"G",W/2,112);
+  if(!SAVE.inv.length){ctx.fillStyle="#888";ctx.font="14px sans-serif";ctx.fillText("売れるものがない",W/2,300);}
+  for(let i=0;i<SAVE.inv.length;i++){
+    const y=136+i*38;
+    if(y>462)break;
+    const it=SAVE.inv[i];
+    const def=ALL_ITEMS[it.id];
+    const sel=UI.sell.sel===i;
+    panel(W/2-280,y,560,32,sel);
+    ctx.textAlign="left";
+    const name=def?def.name:it.id;
+    const price=def?Math.max(1,Math.floor(def.price*0.5*it.n)):0;
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font="14px sans-serif";
+    ctx.fillText(name+" ×"+it.n+"   (売却 "+price+"G)",W/2-264,y+21);
+    if(def&&def.img)img(def.img,W/2+232,y+2,28,28,"#665");
+  }
+  if(keyR("ArrowUp","KeyW")){shopNav(-1);playSFX("sfx_click.ogg",1.1);}
+  if(keyR("ArrowDown","KeyS")){shopNav(1);playSFX("sfx_click.ogg",1.1);}
+  if(keyP("KeyZ","Enter"))shopBuy();
+  if(keyP("KeyX","Escape"))closeOverlay();
+}
+function drawHelp(){
+  ctx.fillStyle="rgba(0,0,0,.7)";ctx.fillRect(0,0,W,H);
+  panel(W/2-330,30,660,480,true);
+  ctx.textAlign="left";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 20px serif";
+  ctx.fillText("操作説明",W/2-300,68);
+   const lines=[
+    "■ ターン制: 1行動=1ターン。待機中なら敵も動かない",
+    "移動: WASD / 矢印キー (8方向・1マス)",
+    "攻撃: Z / J (向いているマス)   待機: Space",
+    "スキル: X / K / L / V   アイテム使用: 1 / 2 / 3 (1ターン)",
+    "装備・アイテム整理: Tab / I (ターン消費なし)",
+    "ポーズ: P / Esc     町でも薬: 1/2/3(自由)",
+    "",
+    "■ ゴール: 100階の「唐揚げ魔王」を倒し、伝説の唐揚げを手にする",
+    "■ 敵の赤い経路=次のターンに突進する兆し。横に避けろ",
+    "■ 敵の弾は毎ターン1マス進む。そのマスを離れれば回避",
+    "■ 死亡時は装備・金・アイテムを全て失う(レベルと解放階は保持)",
+    "",
+    "■ ジョブごとの成長:",
+    "  勇者: 武器を使うほど習熟が上がり威力が増す",
+    "  聖騎士: 神聖の盾で次の敵ターンを75%カット",
+    "  賢者: 魔法を撃つほど魔術書が完成し魔力が上がる",
+    "  召喚士: 召喚獣が毎ターン自動戦闘し実戦で進化",
+    "  無職: 初期ゼロだが成長が誰より速い。万能器用で戦う"
+   ];
+  ctx.fillStyle="#e8d9a0";ctx.font="14px sans-serif";
+  lines.forEach(function(l,i){ctx.fillText(l,W/2-300,96+i*21);});
+  ctx.textAlign="center";
+  ctx.fillStyle="#888";ctx.font="13px sans-serif";
+  ctx.fillText("X / Esc で閉じる",W/2,494);
+  if(keyP("KeyX","Escape")){G.help=false;playSFX("sfx_click.ogg");}
+}
+function drawPause(){
+  ctx.fillStyle="rgba(0,0,0,.5)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 30px serif";
+  ctx.fillText("ポーズ",W/2,H/2);
+  ctx.fillStyle="#888";ctx.font="14px sans-serif";
+  ctx.fillText("P / Esc で再開",W/2,H/2+30);
+}
+function drawToast(){
+  if(UI.toastT>0&&UI.toastMsg){
+    UI.toastT-=1/60;
+    ctx.textAlign="center";
+    ctx.font="bold 15px sans-serif";
+    const w=ctx.measureText(UI.toastMsg).width+40;
+    ctx.fillStyle="rgba(12,10,8,.8)";
+    ctx.fillRect(W/2-w/2,H-72,w,30);
+    ctx.strokeStyle="#6a5a30";ctx.strokeRect(W/2-w/2,H-72,w,30);
+    ctx.fillStyle="#ffd97a";
+    ctx.fillText(UI.toastMsg,W/2,H-52);
+  }
+  if(UI.flashLv>0){
+    UI.flashLv-=1/60;
+    ctx.fillStyle="rgba(255,210,74,"+Math.max(0,UI.flashLv*0.25)+")";
+    ctx.fillRect(0,0,W,H);
+  }
+}
+function drawGameOver(){
+  img("bg_title.png",0,0,W,H,"#0a0a14");
+  ctx.fillStyle="rgba(20,5,5,.75)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#e04040";ctx.font="bold 44px serif";
+  ctx.fillText("倒れた…",W/2,170);
+  ctx.fillStyle="#e8d9a0";ctx.font="15px sans-serif";
+  ctx.fillText(UI.gameoverReason,W/2,215);
+  ctx.fillText("最深記録: "+SAVE.maxFloor+"F    所持金: "+SAVE.gold+"G",W/2,245);
+  ctx.fillStyle="#ffd24a";ctx.font="bold 18px sans-serif";
+  ctx.fillText("Z: 地上(町)に戻る",W/2,320);
+  if(key("KeyZ","Enter")&&!G._o1){
+    G._o1=true;
+    G.screen="town";
+    setupTown();
+    playBGM("bgm_town.ogg");
+    playVoice("voice_shop.ogg");
+  }
+  if(!key("KeyZ","Enter"))G._o1=false;
+}
+function drawClear(){
+  img("bg_clear.png",0,0,W,H,"#1a1226");
+  ctx.fillStyle="rgba(20,14,4,.45)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.shadowColor="#ffb020";ctx.shadowBlur=30;
+  ctx.fillStyle="#ffd97a";ctx.font="bold 46px serif";
+  ctx.fillText("伝説の唐揚げ、奪還!",W/2,150);
+  ctx.shadowBlur=0;
+  img("icon_karaage.png",W/2-45,180,90,90,"#e8942e");
+  ctx.fillStyle="#e8d9a0";ctx.font="16px sans-serif";
+  ctx.fillText("唐揚げ魔王を倒し、黄金の唐揚げを手にした。",W/2,310);
+  ctx.fillText("あなたの物語は、ここで完成だ。",W/2,340);
+  ctx.fillStyle="rgba(200,190,150,.8)";ctx.font="14px sans-serif";
+  ctx.fillText("最終: "+JOBS[SAVE.job].name+" Lv."+SAVE.lv,W/2,390);
+  ctx.fillStyle="#ffd24a";ctx.font="bold 18px sans-serif";
+  ctx.fillText("Z: 地上(町)に戻る   (クリア後も遊べる)",W/2,450);
+  if(key("KeyZ","Enter")&&!G._c1){
+    G._c1=true;
+    G.screen="town";
+    setupTown();
+    playBGM("bgm_town.ogg");
+  }
+  if(!key("KeyZ","Enter"))G._c1=false;
+}
+
+// ============================================================
+// モバイルタッチ操作 (仮想キー方式: K に合成して既存ロジックを流用)
+// ============================================================
+let IS_TOUCH=false;
+window.SUPCLICK=false;
+const JOY={bx:112,by:118,r:54,id:-1,kx:0,ky:0};
+function joySet(dx,dy){
+  const dz=13;
+  VK.w=dy<-dz?1:0;
+  VK.s=dy>dz?1:0;
+  VK.a=dx<-dz?1:0;
+  VK.d=dx>dz?1:0;
+  mergeVK();
+}
+function joyRelease(){
+  if(JOY.id!==-1&&G.screen==="dungeon"&&TURN.phase==="player"&&!UI.bag&&!UI.gate){
+    const dx=JOY.kx,dy=JOY.ky;
+    if(Math.hypot(dx,dy)>13){
+      tryMovePlayer(dirIndex(Math.sign(dx),Math.sign(dy)));
+    }
+  }
+  JOY.id=-1;JOY.kx=0;JOY.ky=0;joySet(0,0);
+}
+const ABTN=[
+  {x:W-86,y:H-88,r:42,k:"z",lb:"Z"},
+  {x:W-186,y:H-60,r:29,k:"x",lb:"X"},
+  {x:W-162,y:H-154,r:29,k:"c",lb:"C"},
+  {x:W-60,y:H-186,r:27,k:"v",lb:"V"},
+  {x:W-252,y:H-70,r:26,k:"wait",lb:"待"},
+  {x:W-252,y:H-150,r:26,k:"bag",lb:"B"}
+];
+const PADMENU=[
+  {x2:W-146,y2:82,k:"up",lb:"▲"},
+  {x2:W-146,y2:174,k:"down",lb:"▼"},
+  {x2:W-192,y2:128,k:"left",lb:"◀"},
+  {x2:W-100,y2:128,k:"right",lb:"▶"}
+];
+// ダンジョン用8方向パッド (矢印はすべて同一の三角形を描画)
+const PAD8C={x:150,y:H-150};
+const PAD8=[
+  {x:0,y:-1,d:["w"]},
+  {x:1,y:0,d:["d"]},
+  {x:0,y:1,d:["s"]},
+  {x:-1,y:0,d:["a"]},
+  {x:1,y:-1,d:["w","d"]},
+  {x:1,y:1,d:["s","d"]},
+  {x:-1,y:1,d:["s","a"]},
+  {x:-1,y:-1,d:["w","a"]}
+];
+const PAD8POS=PAD8.map(function(p,i){
+  return {x:PAD8C.x+p.x*54,y:PAD8C.y+p.y*54,r:22,d:p.d,ang:Math.atan2(p.y,p.x),i:i};
+});
+function drawPadArrow(x,y,r,ang){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.rotate(ang);
+  ctx.fillStyle="rgba(255,255,255,.88)";
+  ctx.beginPath();
+  ctx.moveTo(r*0.7,0);
+  ctx.lineTo(-r*0.42,-r*0.5);
+  ctx.lineTo(-r*0.2,0);
+  ctx.lineTo(-r*0.42,r*0.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+const TOUCH={btn:{},pad:{},pad8:{},ref:{}};
+function pad8Press(b){
+  for(const k of b.d){
+    TOUCH.ref[k]=(TOUCH.ref[k]||0)+1;
+    VK[k]=1;
+  }
+  mergeVK();
+}
+function pad8Release(b){
+  for(const k of b.d){
+    TOUCH.ref[k]=Math.max(0,(TOUCH.ref[k]||0)-1);
+    if(!TOUCH.ref[k])VK[k]=0;
+  }
+  mergeVK();
+}
+function canvasPos(cx,cy){
+  const r=cv.getBoundingClientRect();
+  return {x:(cx-r.left)/r.width*W,y:(cy-r.top)/r.height*H};
+}
+cv.addEventListener("touchstart",function(e){
+  e.preventDefault();
+  IS_TOUCH=true;
+  for(const t of e.changedTouches){
+    const p=canvasPos(t.clientX,t.clientY);
+    mouse.x=t.clientX;mouse.y=t.clientY;
+    let used=false;
+    for(const b of ABTN){
+      if(TOUCH.btn[b.k]===undefined&&Math.hypot(p.x-b.x,p.y-b.y)<=b.r+10){
+        TOUCH.btn[b.k]=t.identifier;
+        if(b.k==="wait"){
+          if(G.screen==="dungeon"&&TURN.phase==="player")endPlayerTurn();
+        }else if(b.k==="bag"){
+          if(G.screen==="dungeon"||G.screen==="town")toggleBag();
+        }else{
+          VK[b.k]=1;mergeVK();
+        }
+        used=true;break;
+      }
+    }
+    if(used)continue;
+    if(G.screen!=="dungeon"){
+      for(const pd of PADMENU){
+        if(TOUCH.pad[pd.k]===undefined&&Math.hypot(p.x-pd.x2,p.y-pd.y2)<=34){
+          TOUCH.pad[pd.k]=t.identifier;
+          VK[pd.k]=1;mergeVK();
+          used=true;break;
+        }
+      }
+    }
+    if(used)continue;
+    if(G.screen==="dungeon"){
+      for(const pd of PAD8POS){
+        if(TOUCH.pad8[pd.i]===undefined&&Math.hypot(p.x-pd.x,p.y-pd.y)<=pd.r+10){
+          TOUCH.pad8[pd.i]=t.identifier;
+          pad8Press(pd);
+          used=true;break;
+        }
+      }
+    }
+    if(used)continue;
+    if(JOY.id===-1&&Math.hypot(p.x-JOY.bx,p.y-JOY.by)<=110){
+      JOY.id=t.identifier;
+      joyMove(p.x,p.y);
+      continue;
+    }
+    if(G.screen==="town"&&TOWN.hover){
+      townActivate(TOWN.hover);
+      window.SUPCLICK=true;
+    }
+  }
+},{passive:false});
+function joyMove(x,y){
+  let dx=x-JOY.bx,dy=y-JOY.by;
+  const d=Math.hypot(dx,dy);
+  if(d>JOY.r){dx=dx/d*JOY.r;dy=dy/d*JOY.r;}
+  JOY.kx=dx;JOY.ky=dy;
+  if(G.screen!=="dungeon")joySet(dx,dy);
+}
+cv.addEventListener("touchmove",function(e){
+  e.preventDefault();
+  for(const t of e.changedTouches){
+    if(JOY.id===t.identifier){
+      const p=canvasPos(t.clientX,t.clientY);
+      joyMove(p.x,p.y);
+    }
+  }
+},{passive:false});
+function touchEnd(e){
+  for(const t of e.changedTouches){
+    if(JOY.id===t.identifier){joyRelease();continue;}
+    for(const k in TOUCH.btn){
+      if(TOUCH.btn[k]===t.identifier){
+        TOUCH.btn[k]=undefined;
+        if(k!=="wait"&&k!=="bag"){VK[k]=0;mergeVK();}
+      }
+    }
+    for(const k in TOUCH.pad){
+      if(TOUCH.pad[k]===t.identifier){TOUCH.pad[k]=undefined;VK[k]=0;mergeVK();}
+    }
+    for(const k in TOUCH.pad8){
+      if(TOUCH.pad8[k]===t.identifier){
+        TOUCH.pad8[k]=undefined;
+        const b=PAD8POS[+k];
+        if(b)pad8Release(b);
+      }
+    }
+  }
+}
+cv.addEventListener("touchend",touchEnd,{passive:false});
+cv.addEventListener("touchcancel",touchEnd,{passive:false});
+function drawTouchUI(){
+  if(!IS_TOUCH)return;
+  const menu=G.screen!=="dungeon";
+  ctx.save();
+  const MENU_ANG={up:Math.PI*1.5,down:Math.PI*0.5,left:Math.PI,right:0};
+  if(menu){
+    for(const pd of PADMENU){
+      const on=!!VK[pd.k];
+      ctx.fillStyle=on?"rgba(255,210,74,.45)":"rgba(255,255,255,.10)";
+      ctx.beginPath();ctx.arc(pd.x2,pd.y2,26,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle="rgba(255,255,255,.35)";ctx.lineWidth=2;ctx.stroke();
+      drawPadArrow(pd.x2,pd.y2,16,MENU_ANG[pd.k]);
+    }
+  }else{
+    for(const pd of PAD8POS){
+      const on=pd.d.some(function(k){return !!VK[k];});
+      ctx.fillStyle=on?"rgba(255,210,74,.45)":"rgba(255,255,255,.10)";
+      ctx.beginPath();ctx.arc(pd.x,pd.y,pd.r,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle="rgba(255,255,255,.35)";ctx.lineWidth=2;ctx.stroke();
+      drawPadArrow(pd.x,pd.y,14,pd.ang);
+    }
+  }
+  for(const b of ABTN){
+    const on=!!VK[b.k];
+    ctx.fillStyle=on?"rgba(255,170,50,.5)":"rgba(255,255,255,.10)";
+    ctx.beginPath();ctx.arc(b.x,b.y,b.r,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle="rgba(255,255,255,.35)";ctx.lineWidth=2;ctx.stroke();
+    ctx.fillStyle="rgba(255,255,255,.9)";
+    ctx.font="bold "+(b.r>36?20:14)+"px sans-serif";
+    ctx.textAlign="center";ctx.textBaseline="middle";
+    ctx.fillText(b.lb,b.x,b.y+1);
+  }
+  const act=JOY.id!==-1;
+  ctx.fillStyle="rgba(255,255,255,.07)";
+  ctx.beginPath();ctx.arc(JOY.bx,JOY.by,JOY.r,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle="rgba(255,255,255,.25)";ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle=act?"rgba(255,210,74,.55)":"rgba(255,255,255,.18)";
+  ctx.beginPath();ctx.arc(JOY.bx+JOY.kx,JOY.by+JOY.ky,24,0,Math.PI*2);ctx.fill();
+  ctx.restore();
+}
+
+// ============================================================
+// メインループ
+// ============================================================
+let lastT=0;
+function loop(ts){
+  const dt=Math.min(0.05,(ts-lastT)/1000||0.016);
+  lastT=ts;
+  FRAME_DT=dt;
+  mergeVK();
+  update(dt);
+  draw();
+  if(IS_TOUCH)drawTouchUI();
+  syncKeys();
+  requestAnimationFrame(loop);
+}
+function boot(){
+  const s=loadSave();
+  SAVE=s;
+  setupTown();
+  if(SAVE)UI.toast("セーブデータを読み込んだ");
+  playBGM("bgm_title.ogg");
+  requestAnimationFrame(loop);
+}
+boot();
+</script>
+</body>
+</html>
