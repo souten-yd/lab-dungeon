@@ -1,0 +1,4960 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>伝説の唐揚げダンジョン</title>
+<style>
+  html,body{margin:0;padding:0;background:#050508;height:100%;overflow:hidden;user-select:none;}
+  body{font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  #cv{image-rendering:pixelated;box-shadow:0 0 60px rgba(255,170,40,.15);border:1px solid #2a2417;background:#000;touch-action:none;}
+  #vig{position:fixed;inset:0;pointer-events:none;box-shadow:inset 0 0 180px rgba(0,0,0,.75);}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv" width="960" height="540"></canvas></div>
+<div id="vig"></div>
+<script>
+"use strict";
+/* ============================================================
+   伝説の唐揚げダンジョン
+   ロウライク・アクションRPG / 上視点 / 1〜100階
+   コードは本ファイル1つ。画像=assets/ 音声=audio/ (MCP生成)
+   ============================================================ */
+
+// ---------- 基本 ----------
+let W=960;const H=540,TILE=32,MW=56,MH=40;
+const cv=document.getElementById("cv"),ctx=cv.getContext("2d");
+ctx.imageSmoothingEnabled=false;
+// (T46) 画面比に応じた横方向拡張: 論理幅Wを端末の縦横比に合わせて伸ばす(H=540固定)
+// → 横向きのスマホ(19.5:9〜20:9)でもキャンバスが画面全体にぴったり(旧: 16:9レターボックス+左右黒帯)
+// ダンジョンの表示域(viewW=W/ZOOM)も横に広がる。タッチUI・パネル・カメラはW基準なので自動追従。
+// 上限W_MAX=1280(超ワイドデスクトップでの描画負荷防止)
+const W_MAX=1280;
+let W_T=0; // (T47) 直近のW拡大時刻(ms)。回転中の旧値縮小を防ぐ単調拡大保証用
+let FIT_T=0; // (T47) 直近のfitCanvas実行時刻(ms)。回転直後のヒット判定緩和使用
+function fitCanvas(){
+  const iw=innerWidth,ih=innerHeight;
+  if(iw>0&&ih>0){
+    // 16:9(960)以上は端末比で横拡張 / 16:9未満(縦長等)は960で保持(レターボックスは許容範囲)
+    const nw=Math.max(960,Math.min(W_MAX,Math.round(H*iw/ih)));
+    // (T47) 単調拡大保証: 回転中、一部のブラウザはinnerWidth/innerHeightを旧値のまま返すことがある。
+    // 直近600ms内にWが拡大した直後の旧値縮小はバッファWの縮小だけ保留し、再実行で新値確定を待つ。
+    // (T48) 保留してもCSS rectは必ず「現在」のwindowサイズで再計算する。
+    //  T47の`return`はCSSを旧windowのまま固定していた=遷移中にrectとwindowが乖離→canvasPosが旧rectで
+    //  座標を計算し続けて「見えている位置より下をタップしないと反応しない」状態が固定された(報告症状の根因)。
+    //  バッファは常にそのCSS rect全体へストレッチされる(レターボックスは#wrap側=canvasの外)ので、
+    //  W(バッファ)が新旧どちらでも「rect最新+単純ストレッチ」が常に正しい。
+    if(nw!==W&&!(nw<W&&Date.now()-W_T<600)){
+      W=nw;W_T=Date.now();cv.width=W;ctx.imageSmoothingEnabled=false; // cv.width変更で状態リセットされるためsmoothingも再設定
+    }
+  }
+  const s=Math.min(iw/W,ih/H);
+  cv.style.width=(W*s)+"px";cv.style.height=(H*s)+"px";
+}
+// (T47) 回転ズレ修正: 旧実装はorientationchangeでsetTimeout(150ms)の1回だけ再実行。
+// 回転遷移中(ブラウザが旧/中間のwindowサイズを返す数フレーム)にその1回だけ実行されると
+// 旧値でW/CSSが確定→描画とタッチ判定(canvasPos)がズレたまま固定された。
+// → resize/orientationchangeの両方で即実行+rAF×2と60ms後に確定実行(遷移が落ち着いたら必ず正しく確定する)
+function fitCanvasNow(){
+  FIT_T=Date.now();
+  fitCanvas();
+  requestAnimationFrame(function(){requestAnimationFrame(fitCanvas);});
+  setTimeout(fitCanvas,60);
+}
+// (T47) 回転直後300msはタッチヒット判定の許容半径+20%(遷移中のわずかな誤差を吸収)
+function touchTol(){return Date.now()-FIT_T<300?1.2:1;}
+addEventListener("resize",fitCanvasNow);
+addEventListener("orientationchange",fitCanvasNow);
+fitCanvas();
+
+// ---------- 乱数(シード付き) ----------
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+let RUN_SEED=(Math.random()*1e9|0);
+
+// ---------- 画像 / 音声 ロード(欠落時は代替描画) ----------
+const IMG={},AUD={};
+const IMG_LIST=[
+ "bg_title.png","bg_town.png","bg_clear.png",
+ "hero.png","paladin.png","mage.png","summoner.png","unjob.png",
+ "slime.png","bat.png","skeleton.png","ghost.png","golem.png","imp.png",
+ "fire_imp.png","lava_golem.png","toad.png","snake.png","ice_wraith.png","frost_wolf.png",
+ "shadow.png","eye.png","death_knight.png","reaper.png","fallen.png","archer.png",
+  "demon_guard.png","demon.png","boss_karaage.png",
+  // (T42) 新規26種: 80px(cave_spider〜poison_mist 13種)/96px(残り13種)
+  "cave_spider.png","rat_thief.png","moss_slime.png","tunnel_goblin.png","bone_archer.png","rot_zombie.png","ghost_follower.png",
+  "stone_turret.png","mini_golem.png","imp_swarm.png","fire_orb.png","lava_spider.png","flame_spirit.png",
+  "poison_puffer.png","mire_tentacle.png","poison_mist.png","frost_statue.png","frost_bat.png","ice_archer.png",
+  "shadow_wolf.png","ghost_soldier.png","fallen_follower.png","holy_shield.png","demon_soldier.png","demon_archer.png","imp_minion.png",
+  // (T41) 中ボス9体(192px)
+  "mb_gonta.png","mb_mia.png","mb_kuro.png","mb_ignis.png","mb_mirei.png","mb_glaycia.png","mb_nyx.png","mb_seraphel.png","mb_belial.png",
+  "summon_ken.png","summon_ryu.png","summon_kame.png","summon_hotori.png","summon_kitsune.png",
+  "hero_walk.png","paladin_walk.png","mage_walk.png","summoner_walk.png","unjob_walk.png",
+  "slime_walk.png","bat_walk.png","skeleton_walk.png","ghost_walk.png","golem_walk.png","imp_walk.png",
+  "fire_imp_walk.png","lava_golem_walk.png","toad_walk.png","snake_walk.png","ice_wraith_walk.png","frost_wolf_walk.png",
+  "shadow_walk.png","eye_walk.png","death_knight_walk.png","reaper_walk.png","fallen_walk.png","archer_walk.png",
+  "demon_guard_walk.png","demon_walk.png","boss_karaage_walk.png",
+  // (T42) 新規26種 walkフレーム
+  "cave_spider_walk.png","rat_thief_walk.png","moss_slime_walk.png","tunnel_goblin_walk.png","bone_archer_walk.png","rot_zombie_walk.png","ghost_follower_walk.png",
+  "stone_turret_walk.png","mini_golem_walk.png","imp_swarm_walk.png","fire_orb_walk.png","lava_spider_walk.png","flame_spirit_walk.png",
+  "poison_puffer_walk.png","mire_tentacle_walk.png","poison_mist_walk.png","frost_statue_walk.png","frost_bat_walk.png","ice_archer_walk.png",
+  "shadow_wolf_walk.png","ghost_soldier_walk.png","fallen_follower_walk.png","holy_shield_walk.png","demon_soldier_walk.png","demon_archer_walk.png","imp_minion_walk.png",
+  // (T41) 中ボス9体 walkフレーム
+  "mb_gonta_walk.png","mb_mia_walk.png","mb_kuro_walk.png","mb_ignis_walk.png","mb_mirei_walk.png","mb_glaycia_walk.png","mb_nyx_walk.png","mb_seraphel_walk.png","mb_belial_walk.png",
+  "summon_ken_walk.png","summon_ryu_walk.png","summon_kame_walk.png","summon_hotori_walk.png","summon_kitsune_walk.png",
+ "tile_floor.png","tile_floor_bone.png","tile_floor_fire.png","tile_floor_poison.png","tile_floor_ice.png","tile_floor_dark.png",
+"tile_grass.png","tile_stone.png","tile_water.png","tile_floor_rock.png","tile_floor_marble.png","tile_floor_ash.png",
+ "tile_wall.png","stairs.png","gate.png","savepoint.png","chest.png",
+ "icon_gold.png","icon_hp.png","icon_mp.png","icon_exp.png","icon_karaage.png",
+ "icon_sword.png","icon_blade.png","icon_axe.png","icon_spear.png","icon_bow.png",
+ "icon_orb.png","icon_staff.png","icon_scythe.png","icon_fang.png","icon_holy.png",
+ "icon_leather.png","icon_mail.png","icon_plate.png","icon_shieldmail.png","icon_crown.png",
+ "icon_ring_atk.png","icon_ring_mag.png","icon_ring_def.png","icon_ring_spd.png",
+ "icon_potion_s.png","icon_potion_l.png","icon_ethers.png","icon_summonmat.png",
+ "ui_panel.png","ui_button.png","ui_bar.png"
+];
+// (T51b) ジョブスプライトの内容bbox {x,y,w,h}: 歩行フレームと静止フレームで「実内容サイズ」が異なり、
+//  全体ストレッチ描画だと切り替え時にキャラが一瞬縮む(勇者/聖騎士/無職で約20%縮む)バグ対策。
+//  (T51) の実行時計測(measureImgBBox/getImageData)は canvas のセキュリティポリシー等で
+//  サイレントに失敗し旧挙動へフォールバックする(=「治っていない」報告の原因)ため、
+//  PILでオフライン実測(α>8)した値を静的に埋め込む。どの環境でも確定動作。
+const SPRITE_BB={
+  "hero.png":[0,0,128,128],"hero_walk.png":[30,39,98,88],
+  "paladin.png":[20,19,75,62],"paladin_walk.png":[26,19,56,66],
+  "mage.png":[31,22,65,74],"mage_walk.png":[31,17,65,62],
+  "summoner.png":[32,24,64,72],"summoner_walk.png":[32,24,64,72],
+  "unjob.png":[30,20,66,76],"unjob_walk.png":[20,17,50,67]
+};
+IMG_LIST.forEach(n=>{
+  const im=new Image();
+  im.onload=function(){im._ok=true;invalidateFloor();}; // (T45) 画像遅延読み込み完了で床キャッシュを無効化
+  im.src="assets/"+n;
+  IMG[n]=im;
+});
+const AUD_LIST=[
+ "bgm_title.ogg","bgm_town.ogg","bgm_dungeon.ogg","bgm_boss.ogg","bgm_clear.ogg",
+ // (T37) テーマ別BGM: 10テーマ×3バリアント(英語歌詞ボーカル・1分以上・シームレスループ)
+ "bgm_dun_00_a.ogg","bgm_dun_00_b.ogg","bgm_dun_00_c.ogg",
+ "bgm_dun_01_a.ogg","bgm_dun_01_b.ogg","bgm_dun_01_c.ogg",
+ "bgm_dun_02_a.ogg","bgm_dun_02_b.ogg","bgm_dun_02_c.ogg",
+ "bgm_dun_03_a.ogg","bgm_dun_03_b.ogg","bgm_dun_03_c.ogg",
+ "bgm_dun_04_a.ogg","bgm_dun_04_b.ogg","bgm_dun_04_c.ogg",
+ "bgm_dun_05_a.ogg","bgm_dun_05_b.ogg","bgm_dun_05_c.ogg",
+ "bgm_dun_06_a.ogg","bgm_dun_06_b.ogg","bgm_dun_06_c.ogg",
+ "bgm_dun_07_a.ogg","bgm_dun_07_b.ogg","bgm_dun_07_c.ogg",
+ "bgm_dun_08_a.ogg","bgm_dun_08_b.ogg","bgm_dun_08_c.ogg",
+ "bgm_dun_09_a.ogg","bgm_dun_09_b.ogg","bgm_dun_09_c.ogg",
+  // (T43) 中ボスBGM: 10F帯×1曲(唐揚げ王国崇拝・深い階層ほど崇拝度高い・Karaage!掛け声・約2分)
+  "bgm_mb_01.ogg","bgm_mb_02.ogg","bgm_mb_03.ogg","bgm_mb_04.ogg","bgm_mb_05.ogg",
+  "bgm_mb_06.ogg","bgm_mb_07.ogg","bgm_mb_08.ogg","bgm_mb_09.ogg",
+ "sfx_swing.ogg","sfx_hit.ogg","sfx_ehit.ogg","sfx_pickup.ogg","sfx_stairs.ogg","sfx_warp.ogg",
+ "sfx_levelup.ogg","sfx_skill.ogg","sfx_guard.ogg","sfx_potion.ogg","sfx_shop.ogg",
+ "sfx_death.ogg","sfx_boss.ogg","sfx_victory.ogg","sfx_summon.ogg","sfx_click.ogg",
+ // (T38) 武器kind別攻撃音8種・tier別入手音6種・足音2種・溜め・飛翔
+ "sfx_atk_melee.ogg","sfx_atk_wide.ogg","sfx_atk_pierce.ogg","sfx_atk_shot.ogg",
+ "sfx_atk_multi.ogg","sfx_atk_bomb.ogg","sfx_atk_flash.ogg","sfx_atk_charge.ogg",
+ "sfx_pick_t1.ogg","sfx_pick_t2.ogg","sfx_pick_t3.ogg","sfx_pick_t4.ogg","sfx_pick_t5.ogg","sfx_pick_t6.ogg",
+ "sfx_step1.ogg","sfx_step2.ogg","sfx_charge.ogg","sfx_fly.ogg",
+  // (T50) ぶつかった音: 壁・敵への移動衝突 / 斜め攻撃の壁拒否
+  "sfx_bump.ogg",
+  // (T57) おばあさんの死亡セリフ(「倒れた…」画面上で再生。笑い行=ユーザー指示で廃止)
+  "voice_grandma_die.ogg",
+  // (T58) 「死に戻り」テーマ曲(女性ボーカル/日本語歌詞/約2分)= 死亡後の初回ダンジョン入りのみ
+  "bgm_res.ogg"
+  // (T40/T41) ボイス廃止(ユーザー指示09-15: 日本語TTSに不自然な部分あり→ボイスなしで完成)。playVoice()はAUD未登録ならno-op
+];
+AUD_LIST.forEach(n=>{
+  // (T47) BGMのみ<code><audio></code>要素を作成(44本)。SFXはWeb Audio(下記)→Audio要素はSFX分ゼロ
+  if(n.indexOf("sfx_")===0)return;
+  try{const a=new Audio("audio/"+n);a.preload="auto";AUD[n]=a;}catch(e){}
+});
+// (T47) SFX=Web Audio: <audio>要素を一切使わない
+// - 起動時: 何もfetch/decodeしない(Audio要素数=44=ブラウザの同時メディア上限に届かない)
+// - 初回ユーザー操作(unlockAudio): AudioContext.resume+全34種のfetch+decodeを非同期実行(タイトル画面で完了)
+// - 再生時: createBufferSource()を1発ずつ(同時5本まで重ねOK)=主スレッドfetchスパイクなし・コスト≈0
+// (T46までの<code>new Audio()</code>方式は、モバイルで遅延生成時に初回再生の瞬間にfetch+decodeが集中し
+// プレイ中のフリーズスパイクになっていた=Web Audioへ全面移行)
+const SFX_NAMES=AUD_LIST.filter(function(n){return n.indexOf("sfx_")===0;});
+let ACTX=null,SFX_BUF={},sfxPrefetching=false;
+function getActx(){
+  if(!ACTX){
+    try{
+      const AC=window.AudioContext||window.webkitAudioContext;
+      if(AC)ACTX=new AC();
+    }catch(e){ACTX=null;}
+  }
+  return ACTX;
+}
+function sfxWarmup(){
+  if(sfxPrefetching||SFX_NAMES.length===0)return;
+  sfxPrefetching=true;
+  if(typeof fetch!=="function")return; // ヘッドレス等fetch無し環境ではno-op
+  const ac=getActx();
+  if(ac&&ac.resume){try{ac.resume().catch(function(){});}catch(e){}}
+  SFX_NAMES.forEach(function(n){
+    (function(name){
+      fetch("audio/"+name).then(function(r){
+        if(!r.ok)throw new Error("http "+r.status);
+        return r.arrayBuffer();
+      }).then(function(ab){
+        if(!ac)return;
+        const d=ac.decodeAudioData(ab);
+        if(d&&d.then){d.then(function(b){SFX_BUF[name]=b;}).catch(function(){});}
+        else try{ac.decodeAudioData(ab,function(b){SFX_BUF[name]=b;},function(){});}catch(e){}
+      }).catch(function(){});
+    })(n);
+  });
+}
+
+// ---------- 再生ヘルパ ----------
+let bgmNow=null,bgmLoop=false,bgmPending=false;
+function tryPlayBgm(){
+  if(!bgmNow)return;
+  bgmPending=false;
+  try{
+    const p=bgmNow.play();
+    if(p&&p.then)p.then(function(){if(bgmLoop)bgmNow.loop=true;}).catch(function(){bgmPending=true;});
+  }catch(e){bgmPending=true;}
+  if(bgmLoop)bgmNow.loop=true;
+}
+// (T44) モバイル自動再生制限: ロード時のplay()拒否を最初のユーザー操作(タップ/キー)で再試行
+// (T47) 同一フックでSFXのWeb Audioを起動: AudioContext.resume+全34種prefetch/decode
+function unlockAudio(){
+  sfxWarmup();
+  if(bgmPending)tryPlayBgm();
+}
+function playBGM(n,loop){
+  if(loop===undefined)loop=true;
+  const a=AUD[n];
+  if(!a||!a.src)return;
+  if(bgmNow&&bgmNow!==a){try{bgmNow.pause();}catch(e){}}
+  bgmNow=a;bgmLoop=loop;
+  try{a.currentTime=0;a.playbackRate=1;}catch(e){}
+  if(bgmLoop)a.loop=true;
+  tryPlayBgm();
+}
+function stopBGM(){if(bgmNow){try{bgmNow.pause();}catch(e){}bgmNow=null;}}
+// (T37) テーマ別BGM: その階のテーマの3曲からランダム1曲。100Fはボス曲。
+function themeBgmName(floor){
+  if(floor>=100)return "bgm_boss.ogg";
+  const t=Math.min(9,Math.floor((floor-1)/10));
+  const v=["a","b","c"][Math.floor(Math.random()*3)];
+  return "bgm_dun_"+("0"+t).slice(-2)+"_"+v+".ogg";
+}
+// (T43) 中ボスBGM: 10F帯ごとに唐揚げ王国崇拝曲(深いほど崇拝度高い)。100F大魔王はbgm_boss.ogg維持
+function mbBgmName(floor){
+  const b=Math.floor(floor/10);
+  if(b<1||b>9)return null;
+  return "bgm_mb_0"+b+".ogg";
+}
+function isMbBgm(n){return !!n&&n.indexOf("bgm_mb_")===0;}
+// SFX再生: Web Audio(同時5本まで重ねOK=ターン制の連打対応)
+// decode済みAudioBufferからcreateBufferSource()を発射するだけ(主スレッドコスト≈0)
+function playSFX(n,rate){
+  if(n.indexOf("sfx_")!==0){
+    // 非SFX(将来のボイス等)は<code><audio></code>フォールバック
+    const a=AUD[n];if(!a||!a.src)return;
+    try{a.currentTime=0;a.play().catch(function(){});}catch(e){}
+    return;
+  }
+  const ac=getActx();
+  const buf=SFX_BUF[n];
+  if(!ac||!buf)return;
+  try{
+    const src=ac.createBufferSource();
+    src.buffer=buf;
+    src.playbackRate.value=rate||1;
+    src.connect(ac.destination);
+    src.start();
+  }catch(e){}
+}
+function playVoice(n){const a=AUD[n];if(!a||!a.src)return;try{a.currentTime=0;a.play().catch(function(){});}catch(e){}}
+// (T50) ぶつかった音(スロットル): 長押しで壁に張り付くと毎フレーム衝突判定が通るため0.25秒に1回まで
+let BUMP_LAST=-9;
+function playBumpSFX(){
+  if(G.time-BUMP_LAST<0.25)return;
+  BUMP_LAST=G.time;
+  playSFX("sfx_bump.ogg");
+}
+
+// ---------- 入力 ----------
+const K={},KPHYS={};
+// 仮想キー(モバイルタッチ): K = 物理(KPHYS) OR 仮想(VK) として統合
+const VK={w:0,a:0,s:0,d:0,z:0,x:0,c:0,v:0,up:0,down:0,left:0,right:0};
+const VKCODE={w:"KeyW",a:"KeyA",s:"KeyS",d:"KeyD",z:"KeyZ",x:"KeyX",c:"KeyC",v:"KeyV",up:"ArrowUp",down:"ArrowDown",left:"ArrowLeft",right:"ArrowRight"};
+const VKREV={};
+for(const k in VKCODE)VKREV[VKCODE[k]]=k;
+function mergeVK(){
+  // 物理キーは全codeをKに反映(Enter/Space/J/1-3/K/L等も)
+  for(const c in KPHYS)K[c]=KPHYS[c];
+  // VKCODEキーは 物理 OR 仮想 で決定(仮想キーの解放も反映される)
+  for(const k in VKCODE)K[VKCODE[k]]=!!(KPHYS[VKCODE[k]]||VK[k]);
+}
+addEventListener("keydown",function(e){
+  unlockAudio(); // (T44) 物理キー操作でBGM自動再生を解除
+  KPHYS[e.code]=true;
+  mergeVK();
+  if(["Space","ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].indexOf(e.code)>=0)e.preventDefault();
+  if(e.code==="Tab"||e.code==="KeyI"){
+    e.preventDefault();
+    // (T49) 階段選択表示中はバッグを開かせない(非表示のまま残るのを防ぐ)
+    if(!UI.stairs&&(G.screen==="dungeon"||G.screen==="town"))toggleBag();
+    return;
+  }
+  if((e.code==="KeyP"||e.code==="Escape")&&!e.repeat){ // (T46) OSキーリピート無視: 長押しでポーズ高速トグルするバグ修正
+    if(UI.bag){closeBag();return;}
+    UI.togglePause();
+  }
+});
+addEventListener("keyup",function(e){
+  KPHYS[e.code]=false;
+  mergeVK();
+});
+const KPREV={};
+function key(){
+  for(let i=0;i<arguments.length;i++)if(K[arguments[i]])return true;
+  return false;
+}
+function keyP(){
+  for(let i=0;i<arguments.length;i++)if(K[arguments[i]]&&!KPREV[arguments[i]])return true;
+  return false;
+}
+function syncKeys(){
+  for(const c in K)KPREV[c]=K[c];
+  for(const c in KPREV)if(!K[c])KPREV[c]=false;
+}
+let FRAME_DT=1/60;
+const REPST={};
+function keyR(){
+  for(let i=0;i<arguments.length;i++){
+    const c=arguments[i];
+    if(!K[c]){REPST[c]=0;continue;}
+    if(!KPREV[c]){REPST[c]=0;return true;}
+    let r=REPST[c];
+    r+=FRAME_DT;
+    if(r<0.4){REPST[c]=r;continue;}
+    r-=0.4;
+    if(r>=0.12){REPST[c]=r-0.12;return true;}
+    REPST[c]=r;
+  }
+  return false;
+}
+
+// ---------- 定義: ジョブ ----------
+// ---------- 定義: ジョブ (ターン制: cdはターン数) ----------
+const DIRS=[[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1],[0,-1],[1,-1]];
+const DIR_NAMES=["→","↘","↓","↙","←","↖","↑","↗"];
+const JOBS={
+  hero:{name:"勇者",desc:"攻守均衡の王道の戦士。武器を使うほどその武器が覚醒する。",
+    base:{hp:120,mp:30,atk:14,mag:6,def:10,spd:4},
+    grow:{hp:14,mp:4,atk:3,mag:1,def:2,spd:0.8},
+    skills:[
+      {name:"溜め斬り",cd:4,mp:8,desc:"向いている敵を2.2倍斬撃"},
+      {name:"突進",cd:5,mp:10,desc:"向いている方向に最大3マス移動"},
+      {name:"天翔り双月斬",cd:14,mp:30,desc:"必殺: 周囲2の全敵をatk×3.5で斬り怯え2T。双月の大円環"}
+    ]},
+  paladin:{name:"聖騎士",desc:"盾で受け流す重装の聖戦士。防御が聖光の力になる。",
+    base:{hp:150,mp:40,atk:11,mag:10,def:15,spd:3.4},
+    grow:{hp:17,mp:5,atk:2,mag:2,def:3,spd:0.6},
+    skills:[
+      {name:"聖光斬",cd:4,mp:14,desc:"周囲1マスの敵に聖属性斬撃"},
+      {name:"神聖の盾",cd:6,mp:16,desc:"次の敵ターンまでダメージ75%カット"},
+      {name:"神聖裁き・光の審判",cd:16,mp:34,desc:"必殺: 周囲2をmag×3.0聖爆+自身HP15%治癒。光柱と天使の輪"}
+    ]},
+  mage:{name:"賢者",desc:"魔術で戦う文士。魔法を撃つほど魔術書が完成し魔力が上がる。",
+    base:{hp:90,mp:80,atk:6,mag:16,def:7,spd:4},
+    grow:{hp:10,mp:9,atk:1,mag:3.4,def:1.6,spd:0.8},
+    skills:[
+      {name:"火球術",cd:2,mp:12,desc:"向いている直線6マスに火球"},
+      {name:"氷結術",cd:6,mp:18,desc:"周囲1マスの敵を凍結+ダメージ"},
+      {name:"星霜滅尽",cd:18,mp:40,desc:"必殺: 周囲3をmag×4.0爆発+凍結1T。星砕けの渦"}
+    ]},
+  summoner:{name:"召喚士",desc:"召喚獣を従える魔導士。獣を育てれば育てるほど最強になる。",
+    base:{hp:100,mp:90,atk:7,mag:13,def:8,spd:4},
+    grow:{hp:11,mp:10,atk:1.4,mag:3,def:1.8,spd:0.8},
+    skills:[
+      {name:"召喚",cd:3,mp:25,desc:"召喚獣を呼び出す(獣は毎ターン自動戦闘)"},
+      {name:"獣の加護",cd:8,mp:20,desc:"獣を全治癒し3ターン強化"},
+      {name:"百獣総出・獣神降臨",cd:14,mp:30,desc:"必殺: 獣が周囲2の全敵にmag×2.5で総攻撃+獣強化3T"}
+    ]},
+  unjob:{name:"無職",desc:"何の肩書もない男。初期はゼロだが、誰よりも早く何にでもなれる。",
+    base:{hp:80,mp:40,atk:8,mag:8,def:6,spd:5},
+    grow:{hp:13,mp:6,atk:3.6,mag:3.4,def:2.4,spd:1.0},
+    skills:[
+      {name:"万能器用",cd:3,mp:10,desc:"周囲1マスの敵に複合攻撃(攻+魔で威力)"},
+      {name:"無双乱舞",cd:6,mp:20,desc:"次の2ターン、移動が1行動で2マスに"},
+      {name:"無双・万象崩し",cd:16,mp:28,desc:"必殺: 周囲2を(atk+mag)×3.0で複合爆発。8方向の斬撃"}
+    ]}
+};
+
+// ---------- 定義: 敵20種 + ボス ----------
+// kind: chase / shoot / charge / flying / boss
+const ENEMIES=[
+ {id:"slime",name:"スライム",theme:0,kind:"chase",hp:26,atk:7,def:2,spd:1.6,xp:8,gold:[3,8],r:13,col:"#4fd25a",size:128},
+ {id:"bat",name:"洞窟の蝙蝠",theme:0,kind:"flying",hp:20,atk:8,def:1,spd:3.4,xp:9,gold:[3,9],r:11,col:"#8a5fc9",size:128},
+ {id:"skeleton",name:"骨戦士",theme:1,kind:"chase",hp:48,atk:12,def:5,spd:2.0,xp:14,gold:[6,14],r:14,col:"#d8d4c8",size:128},
+ {id:"ghost",name:"怨霊",theme:1,kind:"flying",hp:40,atk:14,def:3,spd:2.6,xp:16,gold:[8,16],r:13,col:"#9fd8ff",size:128},
+ {id:"golem",name:"岩ゴレム",theme:2,kind:"chase",hp:110,atk:18,def:12,spd:1.1,xp:26,gold:[14,26],r:18,col:"#8f8f96",size:128},
+ {id:"imp",name:"インプ",theme:2,kind:"shoot",hp:34,atk:11,def:4,spd:2.4,xp:18,gold:[10,18],r:12,col:"#c0392b",size:128},
+ {id:"fire_imp",name:"炎インプ",theme:3,kind:"shoot",hp:52,atk:16,def:5,spd:2.8,xp:26,gold:[16,28],r:12,col:"#ff7b2e",size:128},
+ {id:"lava_golem",name:"溶岩ゴレム",theme:3,kind:"charge",hp:180,atk:24,def:14,spd:1.2,xp:40,gold:[24,40],r:18,col:"#e2571c",size:128},
+ {id:"toad",name:"毒ガエル",theme:4,kind:"charge",hp:70,atk:18,def:8,spd:2.2,xp:30,gold:[20,34],r:15,col:"#7ec850",size:128},
+ {id:"snake",name:"毒蛇",theme:4,kind:"chase",hp:60,atk:22,def:7,spd:3.0,xp:32,gold:[22,36],r:13,col:"#4a7a3a",size:128},
+ {id:"ice_wraith",name:"氷の幽霊",theme:5,kind:"shoot",hp:80,atk:24,def:9,spd:2.4,xp:42,gold:[28,44],r:14,col:"#bfe8ff",size:128},
+ {id:"frost_wolf",name:"氷霜の狼",theme:5,kind:"charge",hp:95,atk:28,def:10,spd:3.2,xp:46,gold:[32,48],r:15,col:"#dceef8",size:128},
+ {id:"shadow",name:"影兵",theme:6,kind:"chase",hp:110,atk:32,def:13,spd:3.0,xp:56,gold:[40,58],r:14,col:"#3d2f52",size:128},
+ {id:"eye",name:"魔眼",theme:6,kind:"shoot",hp:70,atk:30,def:8,spd:1.8,xp:52,gold:[38,54],r:13,col:"#c33bd4",size:128},
+ {id:"death_knight",name:"死神騎士",theme:7,kind:"charge",hp:200,atk:40,def:20,spd:2.2,xp:80,gold:[56,80],r:17,col:"#26242e",size:128},
+ {id:"reaper",name:"死神",theme:7,kind:"shoot",hp:130,atk:38,def:14,spd:2.4,xp:74,gold:[52,76],r:15,col:"#5a5a66",size:128},
+ {id:"fallen",name:"堕天の天使",theme:8,kind:"flying",hp:160,atk:44,def:18,spd:3.0,xp:96,gold:[68,96],r:16,col:"#e8e2d0",size:128},
+ {id:"archer",name:"聖骸の弓手",theme:8,kind:"shoot",hp:110,atk:48,def:14,spd:2.6,xp:90,gold:[64,90],r:14,col:"#cfc4a8",size:128},
+ {id:"demon_guard",name:"魔王衛兵",theme:9,kind:"chase",hp:260,atk:52,def:26,spd:2.4,xp:120,gold:[86,120],r:17,col:"#7a1f2b",size:128},
+ {id:"demon",name:"魔族将軍",theme:9,kind:"shoot",hp:200,atk:58,def:22,spd:2.6,xp:130,gold:[96,130],r:16,col:"#4a1030",size:128},
+  {id:"mimic",name:"ミミック",theme:10,kind:"chase",hp:140,atk:30,def:12,spd:2.8,xp:60,gold:[60,110],r:15,col:"#a8763e",size:128,mimic:true},
+// (T42) 新規26種: テーマ2種→6種、序盤の厚みと種別(射撃/突進/浮遊)の補完
+ {id:"cave_spider",name:"洞窟クモ",theme:0,kind:"chase",hp:24,atk:7,def:1,spd:2.8,xp:9,gold:[3,9],r:12,col:"#6a4a6a",size:80},
+ {id:"rat_thief",name:"泥棒ネズミ",theme:0,kind:"chase",hp:22,atk:8,def:2,spd:3.0,xp:9,gold:[4,10],r:11,col:"#8a6f4a",size:80},
+ {id:"moss_slime",name:"苔スライム",theme:0,kind:"chase",hp:32,atk:6,def:3,spd:1.4,xp:8,gold:[3,8],r:14,col:"#5a8a4a",size:80},
+ {id:"tunnel_goblin",name:"トンネルゴブリン",theme:0,kind:"chase",hp:28,atk:9,def:3,spd:2.2,xp:10,gold:[4,10],r:13,col:"#7a9a5a",size:80},
+ {id:"bone_archer",name:"骨弓手",theme:1,kind:"shoot",hp:36,atk:14,def:3,spd:1.8,xp:15,gold:[7,15],r:13,col:"#c8c4b0",size:96},
+ {id:"rot_zombie",name:"腐敗ゾンビ",theme:1,kind:"charge",hp:62,atk:13,def:4,spd:1.2,xp:15,gold:[6,14],r:15,col:"#6a8a5a",size:96},
+ {id:"ghost_follower",name:"亡霊の従者",theme:1,kind:"flying",hp:34,atk:13,def:2,spd:2.8,xp:16,gold:[8,16],r:12,col:"#b8d8e8",size:96},
+ {id:"stone_turret",name:"石の砲台",theme:2,kind:"shoot",hp:50,atk:16,def:8,spd:0.8,xp:22,gold:[12,22],r:15,col:"#8a8a92",size:96},
+ {id:"mini_golem",name:"小ゴレム",theme:2,kind:"chase",hp:80,atk:16,def:10,spd:1.0,xp:24,gold:[13,24],r:16,col:"#7f7f88",size:96},
+ {id:"imp_swarm",name:"インプの群れ",theme:2,kind:"flying",hp:40,atk:13,def:3,spd:3.0,xp:20,gold:[11,19],r:12,col:"#d04a3a",size:96},
+ {id:"fire_orb",name:"炎のオーブ",theme:3,kind:"shoot",hp:46,atk:18,def:4,spd:2.6,xp:26,gold:[16,28],r:12,col:"#ff8a3a",size:80},
+ {id:"lava_spider",name:"溶岩クモ",theme:3,kind:"chase",hp:58,atk:19,def:5,spd:3.0,xp:28,gold:[17,29],r:13,col:"#e05a2a",size:80},
+ {id:"flame_spirit",name:"炎の精霊",theme:3,kind:"flying",hp:42,atk:18,def:4,spd:3.2,xp:26,gold:[16,28],r:12,col:"#ffb04a",size:80},
+ {id:"poison_puffer",name:"毒フグ",theme:4,kind:"charge",hp:82,atk:17,def:9,spd:1.4,xp:30,gold:[20,34],r:15,col:"#9ac85a",size:80},
+ {id:"mire_tentacle",name:"沼の触手",theme:4,kind:"shoot",hp:56,atk:20,def:5,spd:1.0,xp:30,gold:[20,34],r:14,col:"#5a9a6a",size:80},
+ {id:"poison_mist",name:"毒の霧",theme:4,kind:"flying",hp:48,atk:19,def:4,spd:2.4,xp:30,gold:[20,34],r:13,col:"#8ac87a",size:80},
+ {id:"frost_statue",name:"氷霜の像",theme:5,kind:"shoot",hp:105,atk:23,def:12,spd:0.9,xp:42,gold:[28,44],r:16,col:"#a8d8e8",size:96},
+ {id:"frost_bat",name:"氷霜の蝙蝠",theme:5,kind:"flying",hp:55,atk:25,def:5,spd:3.6,xp:42,gold:[28,44],r:12,col:"#c8e8f8",size:96},
+ {id:"ice_archer",name:"氷の弓手",theme:5,kind:"shoot",hp:65,atk:27,def:7,spd:2.0,xp:44,gold:[30,46],r:13,col:"#d8f0ff",size:96},
+ {id:"shadow_wolf",name:"影の狼",theme:6,kind:"charge",hp:125,atk:31,def:12,spd:3.4,xp:56,gold:[40,62],r:16,col:"#3a2a5a",size:96},
+ {id:"ghost_soldier",name:"亡霊兵",theme:7,kind:"chase",hp:145,atk:36,def:13,spd:2.2,xp:74,gold:[46,74],r:15,col:"#8a9ab8",size:96},
+ {id:"fallen_follower",name:"堕天の従者",theme:8,kind:"flying",hp:95,atk:34,def:10,spd:3.0,xp:90,gold:[56,88],r:13,col:"#d8c8e8",size:96},
+ {id:"holy_shield",name:"聖盾の番人",theme:8,kind:"chase",hp:185,atk:32,def:20,spd:1.6,xp:92,gold:[58,90],r:16,col:"#e8d8a0",size:96},
+ {id:"demon_soldier",name:"悪魔兵",theme:9,kind:"chase",hp:160,atk:42,def:16,spd:2.6,xp:110,gold:[66,104],r:15,col:"#a03030",size:96},
+ {id:"demon_archer",name:"悪魔弓手",theme:9,kind:"shoot",hp:100,atk:44,def:11,spd:2.4,xp:108,gold:[64,100],r:13,col:"#c05050",size:96},
+ {id:"imp_minion",name:"インプの召使",theme:9,kind:"flying",hp:70,atk:40,def:8,spd:3.4,xp:104,gold:[60,96],r:12,col:"#d07040",size:96},
+ {id:"boss_karaage",name:"唐揚げ魔王",theme:10,kind:"boss",hp:3200,atk:66,def:30,spd:2.6,xp:999,gold:[500,800],r:30,col:"#e8942e",size:192}
+];
+const EBY={};ENEMIES.forEach(function(e){EBY[e.id]=e;});
+
+// ---------- 定義: 中ボス9体 (T41: 10F毎に階段を守る) ----------
+// kind:"boss"でbossAct(AI)を共有。idle=会話まで無害、fight=戦闘中。
+const MBOSSES={
+  10:{id:"mb_gonta",name:"トンネルの鼠王「ゴンタ」",gender:"m",weapon:"w_ratfang",hp:520,atk:30,def:12,spd:2.8,xp:160,gold:[120,180],r:26,col:"#a8783e",size:192,
+    open:"フハハ! 階段は俺の縄張りだ! 通行料を払って行け!!",
+    die:"がっ…トンネルの王は落ちた…牙は次のネズミに…"},
+  20:{id:"mb_mia",name:"骨の乙女「ミア」",gender:"f",weapon:"w_boneflute",hp:600,atk:36,def:12,spd:2.2,xp:200,gold:[150,220],r:26,col:"#d8d4c8",size:192,
+    open:"誰が…永遠の眠りを乱すの…骨笛が…貴方を導いてあげる…",
+    die:"わたくし…解き放たれた…この墓は…わたくしの牢だった…"},
+  30:{id:"mb_kuro",name:"鍛冶場ゴレム「クロ」",gender:"m",weapon:"w_forgehammer",hp:780,atk:44,def:20,spd:1.4,xp:250,gold:[190,280],r:28,col:"#8f8f96",size:192,
+    open:"ガオオオ!! 鍛冶場に侵入者!! 叩き潰して平らな板にする!!",
+    die:"炉の火が…消える…この槌は…次への…"},
+  40:{id:"mb_ignis",name:"火炎公爵「イグニス」",gender:"m",weapon:"w_flamefang",hp:900,atk:52,def:18,spd:2.6,xp:320,gold:[240,340],r:27,col:"#e2571c",size:192,
+    open:"公爵の領域に踏み込んだ凡人か! 燃えよ、灰になれ!!",
+    die:"ぐはっ…炎は…消えない…貴方の心臓に…残しておいてやる…"},
+  50:{id:"mb_mirei",name:"沼の魔女「ミレイ」",gender:"f",weapon:"w_mirefang",hp:860,atk:56,def:16,spd:2.0,xp:360,gold:[270,380],r:26,col:"#5a9a6a",size:192,
+    open:"ヒィヒィヒ…新鮮なお供えが~ 沼の抱擁は…心地いいのよ~",
+    die:"沼が…もう一つ…魂を…呑んだ…ヒィヒィヒ…"},
+  60:{id:"mb_glaycia",name:"氷の聖騎士「グレイシア」",gender:"f",weapon:"w_frostblade",hp:1050,atk:60,def:24,spd:2.2,xp:430,gold:[320,450],r:27,col:"#bfe8ff",size:192,
+    open:"異端よ。聖堂を貴方の存在で穢すとは…裁きを下す。",
+    die:"裁きは…間違っていた…氷が…貴方を…包んで…あげる…"},
+  70:{id:"mb_nyx",name:"影の暗殺者「ニクス」",gender:"m",weapon:"w_shadowblade",hp:1150,atk:70,def:20,spd:3.4,xp:520,gold:[380,540],r:26,col:"#3a2a5a",size:192,
+    open:"…………",
+    die:"………"},
+  80:{id:"mb_seraphel",name:"堕天の天使「セラフェル」",gender:"f",weapon:"w_fallwing",hp:1300,atk:78,def:24,spd:2.6,xp:640,gold:[460,640],r:28,col:"#d8c8e8",size:192,
+    open:"また、赦しを求める者か…天がわたくしの祈りを聞き捨てたのは、いつのことだっただろう…",
+    die:"わたくしは…光を…見た…翼は…もう…堕ちない…"},
+  90:{id:"mb_belial",name:"魔王の副官「ベリアル」",gender:"m",weapon:"w_praystaff",hp:1500,atk:86,def:28,spd:2.8,xp:800,gold:[560,800],r:29,col:"#a03030",size:192,
+    open:"跪け、凡人。唐揚げ大魔王は全ての世界を喰らう。貴方の死は、祈りである。",
+    die:"唐揚げ…大魔王は…全ての世界を…喰らう…わたくしも…後から…行く…"}
+};
+// HP段階の共通台詞プール(性別別)
+const MBV_LINES={
+  m_mid:["傷? 些細なことだ。","はっ! 程度か!?","まだ立っている? 面白い。"],
+  f_mid:["ふん…。","それだけ? ……","まだ、戦えるわ。"],
+  m_low:["まさか…!","貴様…本気か…!","ぐっ…ここまでか…!"],
+  f_low:["…!","力…が…","…まだ…倒れない…"],
+  m_die:["…終わり…か。","くっ…!!","ふっ…良い…一戦だった…"],
+  f_die:["…ふふ…","…ごめん…なさい…","…これで…解放…"],
+};
+
+// ---------- 定義: 召喚獣5種 ----------
+const SUMMONS=[
+ {id:"summon_ken",name:"戦鶏 ケン",img:"summon_ken.png",col:"#e8c25a",ai:"melee",desc:"先鋭の鶏武者。近接で追撃する。"},
+ {id:"summon_ryu",name:"炎竜 リュウ",img:"summon_ryu.png",col:"#ff6b2e",ai:"shoot",desc:"火球を吐く古竜。遠距離で火力支援。"},
+ {id:"summon_kame",name:"鉄亀 カメ",img:"summon_kame.png",col:"#5a9e6b",ai:"wall",desc:"鉄の甲羅で盾になり、接近した敵を弾き返す。"},
+ {id:"summon_hotori",name:"雷鳥 ホトリ",img:"summon_hotori.png",col:"#7ec8ff",ai:"dash",desc:"雷を纏い高速で敵を蹴散らす。"},
+ {id:"summon_kitsune",name:"影狐 キツネ",img:"summon_kitsune.png",col:"#9a6bd4",ai:"stalk",desc:"影を忍び歩き、元気を残す敵を狙い撃つ。"}
+];
+const SUMMON_BY={};SUMMONS.forEach(function(s){SUMMON_BY[s.id]=s;});
+const SUM_STAGE={hp:[1,1.35,1.8,2.4,3.1,4,5.1,6.5,8.2,10.5],atk:[1,1.4,1.9,2.5,3.2,4.1,5.2,6.6,8.4,10.6]};
+
+// ---------- 定義: アイテム ----------
+// kind: melee(向きの1マス)/wide(3マスの弧)/pierce(直線N貫通・全命中)/shot(直線・初命中の投射弾)/multi(3方向同時)/charge(1T溜め→発射)/bomb(投射→着弾AoE)/flash(半径AoE+麻痺)
+const WEAPONS=[
+  {id:"w_sword",name:"鋼の剣",img:"icon_sword.png",atk:6,mag:0,tier:1,price:150,kind:"melee",range:1,desc:"向きの1マスを斬る"},
+  {id:"w_blade",name:"大剣",img:"icon_blade.png",atk:11,mag:0,tier:2,price:420,kind:"wide",range:1,desc:"正面3マスの弧を薙ぐ"},
+  {id:"w_axe",name:"戦斧",img:"icon_axe.png",atk:16,mag:0,tier:3,price:900,kind:"melee",range:1,stagger:0.25,desc:"一撃25%で怯え(1ターン)"},
+  {id:"w_spear",name:"槍",img:"icon_spear.png",atk:12,mag:2,tier:2,price:460,kind:"pierce",range:3,desc:"直線3マス貫通・全命中"},
+  {id:"w_bow",name:"狩猟の弓",img:"icon_bow.png",atk:9,mag:4,tier:2,price:440,kind:"shot",range:6,desc:"直線・初命中の矢(6マス)"},
+  {id:"w_orb",name:"魔導玉",img:"icon_orb.png",atk:0,mag:14,tier:2,price:520,kind:"shot",range:5,desc:"直線・初命中の魔弾(5マス)"},
+  {id:"w_staff",name:"賢者の杖",img:"icon_staff.png",atk:0,mag:20,tier:3,price:1100,kind:"pierce",range:4,desc:"貫通する魔力線(4マス)"},
+  {id:"w_scythe",name:"死神の鎌",img:"icon_scythe.png",atk:24,mag:8,tier:4,price:2200,kind:"wide",range:1,desc:"正面3マスを薙ぐ大鎌"},
+  {id:"w_fang",name:"竜牙",img:"icon_fang.png",atk:30,mag:14,tier:5,price:4200,kind:"pierce",range:3,desc:"高威力の貫通突き(3マス)"},
+  {id:"w_holy",name:"伝説の唐揚げ包丁",img:"icon_holy.png",atk:40,mag:20,tier:6,price:8000,legend:true,kind:"melee",range:1,followup:0.3,desc:"向きの1マス・30%追撃"},
+  {id:"w_lancespear",name:"短槍",img:"icon_spear.png",atk:8,mag:0,tier:1,price:260,minFloor:3,kind:"pierce",range:2,desc:"素早い突き(2マス貫通)"},
+  {id:"w_pistol",name:"拳銃",img:"icon_fang.png",atk:5,mag:0,tier:2,price:700,minFloor:5,kind:"shot",range:4,shots:2,desc:"2連射・各初命中(4マス)"},
+  {id:"w_flash",name:"閃光弾",img:"icon_orb.png",atk:0,mag:6,tier:3,price:1400,minFloor:10,kind:"flash",range:2,stun:2,desc:"周囲半径2を眩光・麻痺2ターン"},
+  {id:"w_grenade",name:"グレネードランチャー",img:"icon_bow.png",atk:0,mag:12,tier:3,price:1600,minFloor:15,kind:"bomb",range:4,boom:1,desc:"4マス先に着弾・半径1爆発"},
+  {id:"w_lance",name:"ランス",img:"icon_staff.png",atk:18,mag:0,tier:3,price:1800,minFloor:12,kind:"pierce",range:5,desc:"重い貫通突き(5マス)"},
+  {id:"w_revolver",name:"リボルバー",img:"icon_axe.png",atk:7,mag:0,tier:4,price:2600,minFloor:20,kind:"multi",range:4,desc:"正面+斜め2方向同時(4マス)"},
+  {id:"w_spiritbow",name:"精霊の弓",img:"icon_bow.png",atk:0,mag:16,tier:4,price:2800,minFloor:25,kind:"shot",range:7,mult:1.3,desc:"精霊の矢(7マス×1.3)"},
+  {id:"w_laser",name:"古代レーザー銃",img:"icon_orb.png",atk:0,mag:24,tier:5,price:4800,minFloor:40,kind:"pierce",range:6,beam:1,desc:"全貫通ビーム(6マス)"},
+  {id:"w_wave",name:"波動砲",img:"icon_staff.png",atk:0,mag:30,tier:5,price:5200,minFloor:50,kind:"charge",range:8,desc:"1T溜め→直線8マスの波動"},
+  {id:"w_rocket",name:"ロケット砲",img:"icon_spear.png",atk:0,mag:20,tier:5,price:5000,minFloor:45,kind:"bomb",range:5,boom:1,mult:1.5,desc:"高威力ロケット(半径1×1.5)"},
+  {id:"w_blackhole",name:"ブラックホールキャノン",img:"icon_orb.png",atk:0,mag:28,tier:6,price:7200,minFloor:70,kind:"bomb",range:5,boom:2,pull:1,desc:"半径2の黑洞+敵を吸い込む"},
+  {id:"w_thunderhammer",name:"雷鳴の槌",img:"icon_axe.png",atk:34,mag:26,tier:6,price:7600,minFloor:80,kind:"charge",range:0,boom:3,thunder:1,desc:"1T溜め→周囲半径3落雷"},
+  // (T41) 中ボス専用武器9種: 店売りなし(noShop)・討伐報酬のみ
+  {id:"w_ratfang",name:"鼠牙の短剣",img:"icon_fang.png",atk:10,mag:0,tier:2,noShop:true,kind:"melee",range:1,followup:0.3,desc:"鼠王の牙。30%追撃"},
+  {id:"w_boneflute",name:"骨笛",img:"icon_orb.png",atk:0,mag:12,tier:2,noShop:true,kind:"flash",range:1,stun:1,desc:"骨笛の調べで半径1を眩光・麻痺1T"},
+  {id:"w_forgehammer",name:"鍛冶の槌",img:"icon_axe.png",atk:20,mag:0,tier:3,noShop:true,kind:"wide",range:1,desc:"鍛冶場の巨槌。正面3マスの弧"},
+  {id:"w_flamefang",name:"焔の牙",img:"icon_spear.png",atk:26,mag:0,tier:3,noShop:true,kind:"pierce",range:3,desc:"炎を纏う牙。直線3貫通"},
+  {id:"w_mirefang",name:"毒牙の杖",img:"icon_staff.png",atk:0,mag:24,tier:3,noShop:true,kind:"shot",range:6,desc:"毒牙の魔弾(6マス)"},
+  {id:"w_frostblade",name:"氷晶の剣",img:"icon_sword.png",atk:0,mag:26,tier:4,noShop:true,kind:"charge",range:7,desc:"1T溜め→直線7マスの氷波動"},
+  {id:"w_shadowblade",name:"影刃",img:"icon_blade.png",atk:36,mag:0,tier:4,noShop:true,kind:"melee",range:1,followup:0.45,desc:"影を纏う刃。45%追撃"},
+  {id:"w_fallwing",name:"堕天の翼",img:"icon_bow.png",atk:0,mag:28,tier:4,noShop:true,kind:"multi",range:5,desc:"堕ちた翼の魔光を3方向に(5マス)"},
+  {id:"w_praystaff",name:"祈祷の杖",img:"icon_orb.png",atk:0,mag:34,tier:5,noShop:true,kind:"bomb",range:5,boom:2,desc:"祈祷の爆弾。5マス先に半径2爆発"}
+];
+const ARMORS=[
+  {id:"a_leather",name:"革の鎧",img:"icon_leather.png",def:4,tier:1,price:120,desc:"素早い軽鎧"},
+  {id:"a_mail",name:"鎖帷子",img:"icon_mail.png",def:9,tier:2,price:380,desc:"定番の鎖鎧"},
+  {id:"a_boots",name:"軽戦靴",img:"icon_leather.png",def:8,tier:2,price:900,minFloor:5,pitReduction:0.5,desc:"穴のダメージ50%減"},
+  {id:"a_plate",name:"鋼の板鎧",img:"icon_plate.png",def:16,tier:3,price:850,desc:"堅牢な板鎧"},
+  {id:"a_wind",name:"風防の鎧",img:"icon_mail.png",def:12,tier:3,price:2000,minFloor:10,poisonReduction:0.5,desc:"毒ガスのダメージ50%減"},
+  {id:"a_wing",name:"翼の羽衣",img:"icon_mail.png",def:10,tier:3,price:2200,minFloor:12,flight:1,desc:"飛翔1: 毒ガス・穴に無効"},
+  {id:"a_shieldmail",name:"盾鎧",img:"icon_shieldmail.png",def:24,tier:4,price:1800,desc:"盾を一体化した重鎧"},
+  {id:"a_ancient",name:"古代の装甲",img:"icon_plate.png",def:18,tier:4,price:3200,minFloor:30,chargeMove:1,desc:"溜め中の武器でも移動可能"},
+  {id:"a_pegasus",name:"ペガサスの鎧",img:"icon_plate.png",def:18,tier:4,price:3800,minFloor:40,flight:2,desc:"飛翔2: 水面も渡れる"},
+  {id:"a_crown",name:"伝説の唐揚げの羽織",img:"icon_crown.png",def:34,tier:5,price:4500,legend:true,desc:"伝説の羽織"}
+];
+const RINGS=[
+ {id:"r_atk",name:"攻の指輪",img:"icon_ring_atk.png",atk:6,price:500},
+ {id:"r_mag",name:"魔の指輪",img:"icon_ring_mag.png",mag:6,price:500},
+ {id:"r_def",name:"守の指輪",img:"icon_ring_def.png",def:6,price:450},
+ {id:"r_spd",name:"速の指輪",img:"icon_ring_spd.png",spd:1.2,price:550}
+];
+const CONSUMABLES=[
+ {id:"p_hp_s",name:"HPの薬(小)",img:"icon_potion_s.png",hp:60,price:60},
+ {id:"p_hp_l",name:"HPの薬(大)",img:"icon_potion_l.png",hp:200,price:180},
+ {id:"p_mp",name:"エーテル",img:"icon_ethers.png",mp:80,price:90},
+ {id:"s_mat",name:"獣の鱗",img:"icon_summonmat.png",summon:1,price:400,desc:"召喚獣強化に使う"}
+];
+const ALL_ITEMS={};
+[...WEAPONS,...ARMORS,...RINGS,...CONSUMABLES].forEach(function(it){ALL_ITEMS[it.id]=it;});
+
+// ---------- 定義: 階層テーマ(10) ----------
+const THEMES=[
+ {name:"地下回廊",floor:"tile_floor.png",wall:"#3a3630",enemies:["slime","bat","cave_spider","rat_thief","moss_slime","tunnel_goblin"],tint:"#2a2622"},
+ {name:"骨の地下墓",floor:"tile_floor_bone.png",wall:"#4a463e",enemies:["skeleton","ghost","bone_archer","rot_zombie","ghost_follower"],tint:"#33302a"},
+ {name:"ゴレムの石殿",floor:"tile_stone.png",wall:"#4a4a52",enemies:["golem","imp","stone_turret","mini_golem","imp_swarm"],tint:"#2e2e34"},
+ {name:"溶岩洞窟",floor:"tile_floor_fire.png",wall:"#4a2a1c",enemies:["fire_imp","lava_golem","fire_orb","lava_spider","flame_spirit"],tint:"#33201a"},
+ {name:"毒沼の底",floor:"tile_grass.png",wall:"#2e4a2a",enemies:["toad","snake","poison_puffer","mire_tentacle","poison_mist"],tint:"#1e3320"},
+ {name:"氷の聖堂",floor:"tile_floor_ice.png",wall:"#2a4a5a",enemies:["ice_wraith","frost_wolf","frost_statue","frost_bat","ice_archer"],tint:"#1e3340"},
+ {name:"暗黒の深淵",floor:"tile_floor_rock.png",wall:"#241a33",enemies:["shadow","eye","shadow_wolf"],tint:"#181022"},
+ {name:"亡霊王の城塞",floor:"tile_floor_dark.png",wall:"#2e2a38",enemies:["death_knight","reaper","ghost_soldier"],tint:"#221e2c"},
+ {name:"天使の遺跡",floor:"tile_floor_marble.png",wall:"#5a5a6a",enemies:["fallen","archer","fallen_follower","holy_shield"],tint:"#3a3a4a"},
+ {name:"魔王の巣窟",floor:"tile_floor_ash.png",wall:"#331018",enemies:["demon_guard","demon","demon_soldier","demon_archer","imp_minion"],tint:"#260c12"}
+];
+function themeOf(f){return THEMES[Math.min(9,Math.floor((f-1)/10))];}
+
+// ============================================================
+// セーブデータ
+// ============================================================
+let SAVE=null;
+function newSave(jobId){
+  const j=JOBS[jobId];
+  return {
+    job:jobId,lv:1,xp:0,gold:300,
+    hp:j.base.hp,mp:j.base.mp,
+    stats:Object.assign({},j.base),
+    equip:{weapon:null,armor:null,ring:null},
+    inv:[{id:"p_hp_s",n:3},{id:"p_mp",n:1}],
+    mastery:{},
+    magicXp:0,
+    summons:{},
+    bossDown:false,
+    floorsVisited:{},
+    maxFloor:1,
+    cleared:false,
+    eyeOpen:false,
+    teleQueue:[], // (T34) 敵の転移トラップで送られた敵 [{floor,id}]
+    miniBossDefeated:{}, // (T41) 討伐済み中ボス {floor:true} = 死亡しても保持
+    resBgmPending:false, // (T58) 「死に戻り」曲未再生=true → 死亡後の初回ダンジョン入りのみbgm_resを流す
+    savedAt:null
+  };
+}
+function loadSave(){try{const s=localStorage.getItem("karaage_dungeon_save");if(s)return JSON.parse(s);}catch(e){}return null;}
+function storeSave(){try{localStorage.setItem("karaage_dungeon_save",JSON.stringify(SAVE));SAVE.savedAt=Date.now();}catch(e){}}
+function clearSave(){try{localStorage.removeItem("karaage_dungeon_save");}catch(e){}}
+
+// 派生ステータス
+function dStats(){
+  const s=SAVE,base=s.stats;
+  let atk=base.atk,mag=base.mag,def=base.def,spd=base.spd;
+  const w=s.equip.weapon&&ALL_ITEMS[s.equip.weapon];
+  if(w){atk+=w.atk;mag+=w.mag||0;}
+  const a=s.equip.armor&&ALL_ITEMS[s.equip.armor];
+  if(a)def+=a.def;
+  const r=s.equip.ring&&ALL_ITEMS[s.equip.ring];
+  if(r){atk+=r.atk||0;mag+=r.mag||0;def+=r.def||0;spd+=r.spd||0;}
+  if(s.job==="hero"&&w){const m=s.mastery[w.id]||0;atk+=m*1.5;mag+=m;}
+  if(s.job==="mage"){mag+=Math.min(10,s.magicXp)*1.2;}
+  if(s.job==="unjob"){atk+=s.lv*0.4;mag+=s.lv*0.4;}
+  // 防具パッシブ(T26)
+  const poisonReduction=a&&a.poisonReduction?a.poisonReduction:0; // 風防の鎧: 毒ガス50%減
+  const pitReduction=a&&a.pitReduction?a.pitReduction:0;         // 軽戦靴: 穴ダメージ50%減
+  const chargeMove=a&&a.chargeMove?a.chargeMove:0;                // 古代の装甲: 溜め中に移動可
+  const flight=a&&a.flight?a.flight:0;                            // 飛翔防具: 1=毒/穴無効, 2=+水面
+  return {atk:atk,mag:mag,def:def,spd:spd,hpMax:base.hp,mpMax:base.mp,
+    poisonReduction:poisonReduction,pitReduction:pitReduction,chargeMove:chargeMove,flight:flight};
+}
+function xpNeed(lv){return Math.floor(60*Math.pow(lv,1.35));}
+function gainXp(n){
+  SAVE.xp+=n;
+  let lv=SAVE.lv,changed=false;
+  while(SAVE.xp>=xpNeed(lv)){
+    SAVE.xp-=xpNeed(lv);lv++;changed=true;
+    const g=JOBS[SAVE.job].grow;
+    SAVE.stats.hp+=g.hp;SAVE.stats.mp+=g.mp;
+    SAVE.stats.atk+=g.atk;SAVE.stats.mag+=g.mag;
+    SAVE.stats.def+=g.def;SAVE.stats.spd+=g.spd;
+  }
+  if(changed){
+    SAVE.lv=lv;
+    const d=dStats();
+    SAVE.hp=Math.min(d.hpMax,SAVE.hp+d.hpMax*0.4);
+    playSFX("sfx_levelup.ogg");
+    UI.toast("レベルアップ! Lv."+lv);
+    UI.flashLv=1;
+  }
+}
+function addItem(id,n){
+  if(n===undefined)n=1;
+  const ex=SAVE.inv.find(function(i){return i.id===id;});
+  if(ex)ex.n+=n;else SAVE.inv.push({id:id,n:n});
+  const it=ALL_ITEMS[id];
+  if(it)UI.toast(it.name+" を入手");
+}
+
+// ============================================================
+// マップ生成 (破綻ゼロ保証: MST接続+BFS検証+フォールバック)
+// ============================================================
+const WALL=0,FLOOR=1,POISON=2,PIT=3,PILLAR=4,LOCKDOOR=5,WATER=6;
+const MAP={grid:null,floor:1,seed:0,rooms:[],entry:null,exit:null,gate:null,savept:null,upstairs:null,theme:null,
+  trapRoom:null,trapDoor:null,trapSwitch:null,secretWall:null};
+function genMap(floor,seed){
+  const rng=mulberry32(((seed*7349+floor*104729)|0)>>>0);
+  for(let att=0;att<10;att++){
+    const g=genAttempt(floor,rng);
+    if(g&&validateMap(g)){
+      MAP.grid=g.grid;MAP.rooms=g.rooms;MAP.entry=g.entry;MAP.exit=g.exit;
+      MAP.upstairs={x:g.entry.x,y:g.entry.y}; // (T48) 上り階段=降りてきた場所(入口/spawnマス)
+      MAP.gate=(floor%10===0&&floor<100)?g.gate:null; // (T54) 100Fはゲートなし(中ボス不在=解放不能なため)
+      MAP.savept=(floor%10===0)?g.savept:null;
+      MAP.trapRoom=g.trapRoom||null;MAP.trapDoor=g.trapDoor||null;MAP.trapSwitch=g.trapSwitch||null;
+      MAP.secretWall=g.secretWall||null;
+      MAP.floor=floor;MAP.seed=seed;MAP.theme=themeOf(floor);
+      return;
+    }
+  }
+  const g=fallbackMap();
+  MAP.grid=g.grid;MAP.rooms=g.rooms;MAP.entry=g.entry;MAP.exit=g.exit;
+  MAP.upstairs={x:g.entry.x,y:g.entry.y}; // (T48) 上り階段=降りてきた場所(入口/spawnマス)
+  MAP.gate=(floor%10===0&&floor<100)?{x:g.exit.x-1,y:g.exit.y}:null; // (T54) 100Fはゲートなし
+  MAP.savept=(floor%10===0)?{x:g.exit.x+1,y:g.exit.y}:null;
+  MAP.trapRoom=null;MAP.trapDoor=null;MAP.trapSwitch=null;MAP.secretWall=null;
+  MAP.floor=floor;MAP.seed=seed;MAP.theme=themeOf(floor);
+}
+function genAttempt(floor,rng){
+  const grid=Array.from({length:MH},function(){return new Array(MW).fill(WALL);});
+  const rooms=[];
+  const NR=Math.min(28,16+Math.floor(floor/7));
+  let guard=0;
+  while(rooms.length<NR&&guard<1200){
+    guard++;
+    const rw=3+Math.floor(rng()*7),rh=3+Math.floor(rng()*7);
+    const rx=1+Math.floor(rng()*(MW-rw-2)),ry=1+Math.floor(rng()*(MH-rh-2));
+    let ok=true;
+    for(let i=0;i<rooms.length;i++){
+      const r=rooms[i];
+      if(rx<r.x+r.w+1&&rx+rw+1>r.x&&ry<r.y+r.h+1&&ry+rh+1>r.y){ok=false;break;}
+    }
+    if(!ok)continue;
+    rooms.push({x:rx,y:ry,w:rw,h:rh,cx:rx+Math.floor(rw/2),cy:ry+Math.floor(rh/2)});
+    for(let y=ry;y<ry+rh;y++)for(let x=rx;x<rx+rw;x++)grid[y][x]=FLOOR;
+  }
+  if(rooms.length<5)return null;
+  // MST(Prim)で全部屋接続 → 完全接続保証
+  const connected=[0];
+  const rest=rooms.map(function(_,i){return i;}).filter(function(i){return i!==0;});
+  while(rest.length){
+    let bi=0,bj=0,bd=1e9;
+    for(let ci of connected){
+      for(let ri of rest){
+        const d=Math.abs(rooms[ci].cx-rooms[ri].cx)+Math.abs(rooms[ci].cy-rooms[ri].cy);
+        if(d<bd){bd=d;bi=ci;bj=ri;}
+      }
+    }
+    carveCorridor(grid,rooms[bi],rooms[bj],rng);
+    connected.push(bj);rest.splice(rest.indexOf(bj),1);
+  }
+  // 環状通路
+  const loops=Math.max(1,Math.floor(rooms.length*0.15));
+  for(let i=0;i<loops;i++){
+    const a=rooms[Math.floor(rng()*rooms.length)],b=rooms[Math.floor(rng()*rooms.length)];
+    if(a!==b)carveCorridor(grid,a,b,rng);
+  }
+  const entry=rooms[0];
+  let far=rooms[0],fd=-1;
+  for(const r of rooms){
+    const d=Math.abs(r.cx-entry.cx)+Math.abs(r.cy-entry.cy);
+    if(d>fd){fd=d;far=r;}
+  }
+  let gate=null,savept=null;
+  if(floor%10===0){
+    const cells=[];
+    for(let y=far.y;y<far.y+far.h;y++)for(let x=far.x;x<far.x+far.w;x++)cells.push({x:x,y:y});
+    // (T54) 100Fはゲートなし(中ボスがいないため解放不能)=セーブポイントのみ保持
+    if(cells.length>=4){if(floor<100)gate={x:cells[0].x,y:cells[0].y};savept={x:cells[1].x,y:cells[1].y};}
+    else{if(floor<100)gate={x:far.cx,y:far.cy};savept={x:far.cx+1,y:far.cy};}
+  }
+  // (T48) 上り階段=降りてきた場所(入口/spawnマスそのもの)=entry。別変数不要
+  const reserved=function(x,y){
+    return (entry.x===x&&entry.y===y)||(far.cx===x&&far.cy===y)||
+      (gate&&gate.x===x&&gate.y===y)||(savept&&savept.x===x&&savept.y===y);
+  };
+  // --- トラップ部屋(5F+): 入口/階段部屋以外・4×4以上 ---
+  let trapDoor=null,trapSwitch=null,trapRoom=null;
+  if(floor>=5){
+    const cands=rooms.filter(function(r){
+      return r!==entry&&r!==far&&r.w>=4&&r.h>=4;
+    });
+    for(let ti=0;ti<cands.length&&!(trapDoor&&trapSwitch);ti++){
+      const r=cands[Math.floor(rng()*cands.length)];
+      // 部屋の境界から外へ1マスのFLOORがドア候補
+      const doors=[];
+      for(let y=r.y;y<r.y+r.h;y++)for(let x=r.x;x<r.x+r.w;x++){
+        for(const d of [[1,0],[-1,0],[0,1],[0,-1]]){
+          const nx=x+d[0],ny=y+d[1];
+          const inRoom=(nx>=r.x&&nx<r.x+r.w&&ny>=r.y&&ny<r.y+r.h);
+          if(!inRoom&&isFloorOf(grid,nx,ny)&&!reserved(nx,ny))doors.push({x:nx,y:ny,ix:x,iy:y});
+        }
+      }
+      if(!doors.length)continue;
+      const door=doors[Math.floor(rng()*doors.length)];
+      // スイッチ=ドアから部屋側へ入った1マス
+      const sw={x:door.ix,y:door.iy};
+      if(reserved(sw.x,sw.y))continue;
+      trapDoor=door;trapSwitch=sw;trapRoom=r;
+    }
+  }
+  // --- 隠し部屋(50%): 壁を1枚押すと開くポケット ---
+  let secretWall=null;
+  if(rng()<0.5){
+    for(let att=0;att<120&&!secretWall;att++){
+      const wx=1+Math.floor(rng()*(MW-2)),wy=1+Math.floor(rng()*(MH-2));
+      if(grid[wy][wx]!==WALL)continue;
+      // 外側にFLOOR(押し込める側)がちょうど1つ
+      const outs=[];
+      for(const d of [[1,0],[-1,0],[0,1],[0,-1]]){
+        if(isFloorOf(grid,wx+d[0],wy+d[1]))outs.push(d);
+      }
+      if(outs.length!==1)continue;
+      // 裏側(外側FLOORと反対側)がポケットになる
+      const ox=wx-outs[0][0],oy=wy-outs[0][1];
+      if(ox<1||oy<1||ox>=MW-1||oy>=MH-1)continue;
+      if(grid[oy][ox]!==WALL)continue;
+      if(reserved(wx,wy)||reserved(ox,oy))continue;
+      secretWall={x:wx,y:wy,ox:ox,oy:oy};
+    }
+  }
+  return {grid:grid,rooms:rooms,entry:{x:entry.cx,y:entry.cy},exit:{x:far.cx,y:far.cy},gate:gate,savept:savept,
+    trapRoom:trapRoom,trapDoor:trapDoor,trapSwitch:trapSwitch,secretWall:secretWall};
+}
+function isFloorOf(g,x,y){return x>=0&&y>=0&&x<MW&&y<MH&&g[y][x]===FLOOR;}
+// 環境ハザード配置: 毒ガス/穴/柱(柱は配置後にBFS再検証で接続性を保証)
+function gridReachable(g,from,to){
+  const seen=new Set([from.y*MW+from.x]);
+  const q=[[from.x,from.y]];
+  while(q.length){
+    const c=q.shift(),x=c[0],y=c[1];
+    if(x===to.x&&y===to.y)return true;
+    for(const d of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx=x+d[0],ny=y+d[1];
+      if(nx<0||ny<0||nx>=MW||ny>=MH)continue;
+      const k=ny*MW+nx;
+      if(seen.has(k)||g[ny][nx]!==FLOOR)continue;
+      seen.add(k);q.push([nx,ny]);
+    }
+  }
+  return false;
+}
+function placeHazards(floor,rng){
+  const grid=MAP.grid;
+  const thIdx=Math.min(9,Math.floor((floor-1)/10));
+  const reservedOf=function(x,y){
+    return (MAP.entry&&MAP.entry.x===x&&MAP.entry.y===y)||
+      (MAP.exit&&MAP.exit.x===x&&MAP.exit.y===y)||
+      (MAP.gate&&MAP.gate.x===x&&MAP.gate.y===y)||
+      (MAP.savept&&MAP.savept.x===x&&MAP.savept.y===y)||
+      (MAP.trapDoor&&MAP.trapDoor.x===x&&MAP.trapDoor.y===y)||
+      (MAP.trapSwitch&&MAP.trapSwitch.x===x&&MAP.trapSwitch.y===y)||
+      (MAP.secretWall&&((MAP.secretWall.x===x&&MAP.secretWall.y===y)||(MAP.secretWall.ox===x&&MAP.secretWall.oy===y)));
+  };
+  const freeCell=function(minD){
+    for(let i=0;i<200;i++){
+      const x=1+Math.floor(rng()*(MW-2)),y=1+Math.floor(rng()*(MH-2));
+      if(grid[y][x]!==FLOOR)continue;
+      const d=Math.abs(x-MAP.entry.x)+Math.abs(y-MAP.entry.y);
+      if(d<minD)continue;
+      if(reservedOf(x,y))continue;
+      return {x:x,y:y};
+    }
+    return null;
+  };
+  // ---- 水辺(T29): 4〜8タイルの池を1〜2箇所。歩行不可なので配置後にBFS検証(切れたら破棄) ----
+  // 池同士は4方向で隣接させない(=連結域として1池4〜8タイルを保証)。初手・成長ともに別池との4方向接触を拒否。
+  const inPool=(p,x,y)=>{for(let i=0;i<p.length;i++){if(p[i].x===x&&p[i].y===y)return true;}return false;};
+  const pondNearWater=function(x,y){
+    for(const d2 of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const wx=x+d2[0],wy=y+d2[1];
+      if(wx>=0&&wy>=0&&wx<MW&&wy<MH&&grid[wy][wx]===WATER)return true;
+    }
+    return false;
+  };
+  const nPond=1+(rng()<0.5?1:0);
+  for(let pi=0;pi<nPond;pi++){
+    // 初手: 既存の水面に4方向で隣接しない床セルを選ぶ(隣接すると別池と連結してサイズ超過)
+    let c=null;
+    for(let t=0;t<30;t++){
+      const cc=freeCell(6);
+      if(!cc)break;
+      if(!pondNearWater(cc.x,cc.y)){c=cc;break;}
+    }
+    if(!c)continue;
+    const pool=[{x:c.x,y:c.y}];
+    grid[c.y][c.x]=WATER;
+    const psize=4+Math.floor(rng()*5);
+    let pg=0;
+    while(pool.length<psize&&pg<60){
+      pg++;
+      const b=pool[Math.floor(rng()*pool.length)];
+      const dd=[[1,0],[-1,0],[0,1],[0,-1]][Math.floor(rng()*4)];
+      const nx=b.x+dd[0],ny=b.y+dd[1];
+      if(nx<1||ny<1||nx>=MW-1||ny>=MH-1)continue;
+      if(grid[ny][nx]!==FLOOR)continue;
+      if(reservedOf(nx,ny))continue;
+      // 別の池と融合しない(同池タイルの隣接は成長としてOK)。池間は床1タイル以上を確保=各池4〜8タイル維持
+      let merge=false;
+      for(const d2 of [[1,0],[-1,0],[0,1],[0,-1]]){
+        const wx=nx+d2[0],wy=ny+d2[1];
+        if(grid[wy][wx]===WATER&&!inPool(pool,wx,wy)){merge=true;break;}
+      }
+      if(merge)continue;
+      grid[ny][nx]=WATER;
+      pool.push({x:nx,y:ny});
+    }
+    if(!gridReachable(grid,MAP.entry,MAP.exit)){
+      for(const q of pool)grid[q.y][q.x]=FLOOR; // 接続が切れたら破棄
+    }
+  }
+  // ---- 毒沼(T29): 連結塊3〜8タイル(ランダムウォークで4方向連結)。毒沼テーマは2倍 ----
+  // (T33)深度スケーリング: 1〜9F=0、50F≒9、100F≒16
+  const nPoison=floor<10?0:Math.min(20,2+Math.floor(floor/7))*(thIdx===4?2:1);
+  for(let i=0;i<nPoison;i++){
+    let c=freeCell(4); // let: ランダムウォークで頭を追跡するため再代入あり
+    if(!c)continue;
+    grid[c.y][c.x]=POISON;
+    let size=2+Math.floor(rng()*6); // 計3〜8タイル
+    let guard=0;
+    while(size>0&&guard<50){
+      guard++;
+      const dd=[[1,0],[-1,0],[0,1],[0,-1]][Math.floor(rng()*4)];
+      const nx=c.x+dd[0],ny=c.y+dd[1];
+      if(nx<1||ny<1||nx>=MW-1||ny>=MH-1)continue;
+      if(grid[ny][nx]!==FLOOR)continue;
+      if(reservedOf(nx,ny))continue;
+      grid[ny][nx]=POISON;
+      c={x:nx,y:ny};
+      size--;
+    }
+  }
+  // ---- 穴(落とし穴)(T33): 1〜15F=0、50F≒4、100F≒7 ----
+  const nPit=floor<16?0:1+Math.floor((floor-10)/15);
+  for(let i=0;i<nPit;i++){
+    const c=freeCell(4);
+    if(c)grid[c.y][c.x]=PIT;
+  }
+  // 柱(5×5以上の部屋に1〜2本)
+  const bigRooms=MAP.rooms.filter(function(r){return r.w>=5&&r.h>=5;});
+  const pillars=[];
+  for(const r of bigRooms){
+    const n=1+Math.floor(rng()*2);
+    for(let i=0;i<n;i++){
+      for(let t=0;t<30;t++){
+        const x=r.x+1+Math.floor(rng()*(r.w-2)),y=r.y+1+Math.floor(rng()*(r.h-2));
+        if(grid[y][x]!==FLOOR)continue;
+        if(Math.abs(x-r.cx)<=1&&Math.abs(y-r.cy)<=1)continue; // 通路の合流中心とその周囲
+        const d=Math.abs(x-MAP.entry.x)+Math.abs(y-MAP.entry.y);
+        if(d<5||reservedOf(x,y))continue;
+        grid[y][x]=PILLAR;
+        if(gridReachable(grid,MAP.entry,MAP.exit))pillars.push({x:x,y:y});
+        else grid[y][x]=FLOOR; // 接続が切れたら破棄
+        break;
+      }
+    }
+  }
+}
+function carveCorridor(g,a,b,rng){
+  const horizFirst=rng()<0.5;
+  const x0=a.cx,y0=a.cy,x1=b.cx,y1=b.cy;
+  const carve=function(x,y){if(x>0&&y>0&&x<MW-1&&y<MH-1)g[y][x]=FLOOR;};
+  if(horizFirst){
+    for(let x=Math.min(x0,x1);x<=Math.max(x0,x1);x++)carve(x,y0);
+    for(let y=Math.min(y0,y1);y<=Math.max(y0,y1);y++)carve(x1,y);
+  }else{
+    for(let y=Math.min(y0,y1);y<=Math.max(y0,y1);y++)carve(x0,y);
+    for(let x=Math.min(x0,x1);x<=Math.max(x0,x1);x++)carve(x,y1);
+  }
+}
+function validateMap(g){
+  const seen=new Set([g.entry.y*MW+g.entry.x]);
+  const q=[[g.entry.x,g.entry.y]];
+  while(q.length){
+    const c=q.shift(),x=c[0],y=c[1];
+    const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+    for(const d of dirs){
+      const nx=x+d[0],ny=y+d[1];
+      if(nx<0||ny<0||nx>=MW||ny>=MH)continue;
+      const k=ny*MW+nx;
+      if(seen.has(k)||g.grid[ny][nx]!==FLOOR)continue;
+      seen.add(k);q.push([nx,ny]);
+    }
+  }
+  if(!seen.has(g.exit.y*MW+g.exit.x))return false;
+  if(g.gate&&!seen.has(g.gate.y*MW+g.gate.x))return false;
+  if(g.savept&&!seen.has(g.savept.y*MW+g.savept.x))return false;
+  return true;
+}
+function fallbackMap(){
+  const grid=Array.from({length:MH},function(){return new Array(MW).fill(WALL);});
+  for(let x=2;x<MW-2;x++){grid[14][x]=FLOOR;grid[15][x]=FLOOR;}
+  const rooms=[{x:2,y:13,w:5,h:3,cx:4,cy:14},{x:MW-7,y:13,w:5,h:3,cx:MW-5,cy:14}];
+  return {grid:grid,rooms:rooms,entry:{x:4,y:14},exit:{x:MW-5,y:14}};
+}
+function isFloor(x,y){return x>=0&&y>=0&&x<MW&&y<MH&&MAP.grid[y][x]===FLOOR;}
+// プレイヤーが踏める床(毒/穴は踏めるが危険。柱・壁・閉鎖ドア・水面は不可)
+function isWalkable(x,y){
+  if(x<0||y<0||x>=MW||y>=MH)return false;
+  const t=MAP.grid[y][x];
+  return t===FLOOR||t===POISON||t===PIT;
+}
+function isWater(x,y){return x>=0&&y>=0&&x<MW&&y<MH&&MAP.grid[y][x]===WATER;}
+// ---- 飛翔 (T32) ----
+// 飛翔レベル: 0=なし, 1=毒/穴/尖刺無効, 2=さらに水面を渡れる
+function flyLevel(){
+  const p=DUNGEON&&DUNGEON.player;
+  if(!p)return 0;
+  const f=dStats().flight||0;
+  if(p.flyT>0)return 2; // 羽ばたく風: 水面含む
+  return f;
+}
+function isFlying(){return flyLevel()>=1;}
+function canCrossWater(){return flyLevel()>=2;}
+// プレイヤー移動用の歩行判定(飛翔中は水面も渡れる)
+function pWalk(x,y){
+  if(isWalkable(x,y))return true;
+  return isWater(x,y)&&canCrossWater();
+}
+
+// ============================================================
+// ダンジョン状態 (ターン制・マス目)
+// ============================================================
+let DUNGEON=null;
+const TURN={phase:"player",t:0,q:null,i:0,busy:false,bufferedDir:-1};
+function enterFloor(floor,fromGate){
+  invalidateFloor(); // (T45) 新フロア=MAP全面変更→床キャッシュ無効化
+  genMap(floor,RUN_SEED);
+  const rng=mulberry32((RUN_SEED^floor*2654435761|0)>>>0);
+  const theme=themeOf(floor);
+  const enemies=[];
+  const drops=[];
+  const isBossFloor=(floor===100);
+  // ---- 環境ハザード+柱(マス収集前に配置: ハザードは床を消費する) ----
+  placeHazards(floor,rng);
+  const cells=[];
+  for(let y=0;y<MH;y++)for(let x=0;x<MW;x++)if(isFloor(x,y))cells.push({x:x,y:y});
+  const occupied={};
+  occupied[MAP.entry.y*MW+MAP.entry.x]=1;
+  occupied[MAP.exit.y*MW+MAP.exit.x]=1;
+  if(MAP.gate)occupied[MAP.gate.y*MW+MAP.gate.x]=1;
+  if(MAP.savept)occupied[MAP.savept.y*MW+MAP.savept.x]=1;
+  if(MAP.trapDoor)occupied[MAP.trapDoor.y*MW+MAP.trapDoor.x]=1;
+  if(MAP.trapSwitch)occupied[MAP.trapSwitch.y*MW+MAP.trapSwitch.x]=1;
+  if(MAP.secretWall){occupied[MAP.secretWall.y*MW+MAP.secretWall.x]=1;occupied[MAP.secretWall.oy*MW+MAP.secretWall.ox]=1;}
+  // ---- トラップ(尖刺/転移) ----
+  const traps=[];
+  const nSpike=2+Math.floor(floor/8);
+  for(let i=0;i<nSpike*3&&traps.filter(function(t){return t.kind==="spike";}).length<nSpike;i++){
+    const c=cells[Math.floor(rng()*cells.length)];
+    const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+    if(d<4||occupied[c.y*MW+c.x])continue;
+    occupied[c.y*MW+c.x]=1;
+    traps.push({tx:c.x,ty:c.y,kind:"spike",armed:true});
+  }
+  if(floor>=5&&rng()<0.7){
+    for(let i=0;i<400;i++){
+      const c=cells[Math.floor(rng()*cells.length)];
+      const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+      if(d<6||occupied[c.y*MW+c.x])continue;
+      occupied[c.y*MW+c.x]=1;
+      traps.push({tx:c.x,ty:c.y,kind:"teleport",armed:true});
+      break;
+    }
+  }
+  // ---- 宝箱(通常89%/罠箱10%/ミミック1%) ----
+  const chests=[];
+  const nCh=2+Math.floor(rng()*2);
+  for(let i=0;i<nCh;i++){
+    const c=cells[Math.floor(rng()*cells.length)];
+    const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+    if(d<5||occupied[c.y*MW+c.x])continue;
+    occupied[c.y*MW+c.x]=1;
+    const cr=rng();
+    let type="normal";
+    if(cr<0.01)type="mimic";
+    else if(cr<0.11)type="trap";
+    chests.push({tx:c.x,ty:c.y,open:false,item:pickChestItem(floor,rng),type:type});
+  }
+  // ---- トラップ部屋の報酬(奥の角: 高ティア宝箱×2+金塊) ----
+  if(MAP.trapRoom&&MAP.trapDoor){
+    const r=MAP.trapRoom;
+    const corners=[
+      {x:r.x,y:r.y},{x:r.x+r.w-1,y:r.y},{x:r.x,y:r.y+r.h-1},{x:r.x+r.w-1,y:r.y+r.h-1}
+    ].filter(function(c){return isFloor(c.x,c.y)&&!occupied[c.y*MW+c.x];});
+    corners.sort(function(a,b){
+      const da=Math.abs(a.x-MAP.trapDoor.x)+Math.abs(a.y-MAP.trapDoor.y);
+      const db=Math.abs(b.x-MAP.trapDoor.x)+Math.abs(b.y-MAP.trapDoor.y);
+      return db-da;
+    });
+    for(let i=0;i<Math.min(2,corners.length);i++){
+      const c=corners[i];
+      occupied[c.y*MW+c.x]=1;
+      chests.push({tx:c.x,ty:c.y,open:false,item:pickChestItem(Math.min(100,floor+10),rng),type:"normal",rich:true});
+    }
+    if(corners.length){
+      const c=corners[0];
+      drops.push({tx:c.x,ty:c.y,x:(c.x+0.5)*TILE,y:(c.y+0.5)*TILE,id:"gold",n:1,amount:80+Math.floor(rng()*120)+floor*5,bob:0,got:false});
+    }
+  }
+  // ---- 隠し部屋の報酬 (T31: 保留→壁崩落時にだけ出現・丸見え解消) ----
+  let secretLoot=null;
+  if(MAP.secretWall){
+    const sw=MAP.secretWall;
+    const loots=[
+      {id:"p_hp_l",n:1,amount:0},
+      {id:"p_mp",n:2,amount:0},
+      {id:"gold",n:1,amount:100+Math.floor(rng()*100)}
+    ];
+    const sDrops=[];
+    for(let i=0;i<loots.length;i++){
+      const cell=(i===0)?{x:sw.ox,y:sw.oy}:{x:sw.x,y:sw.y};
+      const l=loots[i];
+      sDrops.push({tx:cell.x,ty:cell.y,x:(cell.x+0.5)*TILE,y:(cell.y+0.5)*TILE,id:l.id,n:l.n,amount:l.amount,bob:rng()*6,got:false});
+    }
+    // 高品質宝箱も1つ
+    const chCell=(rng()<0.5)?{x:sw.ox,y:sw.oy}:{x:sw.x,y:sw.y};
+    const sChest={tx:chCell.x,ty:chCell.y,open:false,item:pickChestItem(Math.min(100,floor+10),rng),type:"normal",rich:true};
+    secretLoot={drops:sDrops,chest:sChest};
+  }
+  // 敵(マス1つ、重複禁止)
+  const eCount=isBossFloor?6:Math.min(40,10+Math.floor(floor*0.3));
+  let placed=0,tries=0;
+  while(placed<eCount&&tries<800){
+    tries++;
+    const c=cells[Math.floor(rng()*cells.length)];
+    const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+    if(d<6||occupied[c.y*MW+c.x])continue;
+    occupied[c.y*MW+c.x]=1;
+    const pool=theme.enemies;
+    const id=pool[Math.floor(rng()*pool.length)];
+    enemies.push(spawnEnemy(id,c.x,c.y,floor));
+    placed++;
+  }
+  if(isBossFloor){
+    // ボスは階段の隣の床マスに
+    let bt=null;
+    for(let dy=-1;dy<=1&&!bt;dy++)for(let dx=-1;dx<=1;dx++){
+      const bx=MAP.exit.x+dx,by=MAP.exit.y+dy;
+      if(isFloor(bx,by)&&!occupied[by*MW+bx]){bt={x:bx,y:by};break;}
+    }
+    if(!bt)bt={x:MAP.entry.x,y:MAP.entry.y};
+    enemies.push(spawnEnemy("boss_karaage",bt.x,bt.y,floor));
+  }
+  // ---- (T41) 中ボス: 10F帯(10〜90F)で階段の隣に出現。討伐済みなら再出現しない ----
+  if(floor%10===0&&floor<100&&!(SAVE.miniBossDefeated&&SAVE.miniBossDefeated[floor])){
+    let mbt=null;
+    for(let dy=-1;dy<=1&&!mbt;dy++)for(let dx=-1;dx<=1;dx++){
+      const bx=MAP.exit.x+dx,by=MAP.exit.y+dy;
+      if(isFloor(bx,by)&&!occupied[by*MW+bx]){mbt={x:bx,y:by};break;}
+    }
+    if(!mbt)mbt={x:MAP.entry.x,y:MAP.entry.y};
+    occupied[mbt.y*MW+mbt.x]=1;
+    enemies.push(spawnMiniBoss(floor,mbt.x,mbt.y));
+  }
+  // ---- (T34) 転移キュー: 敵が転移トラップを踏んだ敵は、プレイヤーがこの階に到達した時に出現 ----
+  if(SAVE.teleQueue&&SAVE.teleQueue.length){
+    const here=SAVE.teleQueue.filter(function(q){return q.floor===floor;});
+    if(here.length){
+      SAVE.teleQueue=SAVE.teleQueue.filter(function(q){return q.floor!==floor;});
+      storeSave();
+      UI.toast("転移の紋から"+here.length+"体の敵が現れた!");
+    }
+    for(const q of here){
+      for(let t=0;t<200;t++){
+        const c=cells[Math.floor(rng()*cells.length)];
+        const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+        if(d<3||occupied[c.y*MW+c.x])continue;
+        occupied[c.y*MW+c.x]=1;
+        enemies.push(spawnEnemy(q.id,c.x,c.y,floor));
+        break;
+      }
+    }
+  }
+  // ドロップ(マス1つ、敵と重複可)
+  const dCount=12+Math.floor(rng()*8);
+  for(let i=0;i<dCount;i++){
+    const c=cells[Math.floor(rng()*cells.length)];
+    const d=Math.abs(c.x-MAP.entry.x)+Math.abs(c.y-MAP.entry.y);
+    if(d<3)continue;
+    drops.push(makeDrop(c.x,c.y,floor,rng));
+  }
+  DUNGEON={
+    floor:floor,theme:theme,enemies:enemies,drops:drops,chests:chests,
+    traps:traps,
+    ebullets:[],pbullets:[],beams:[],particles:[],floats:[],
+    player:null,time:0,shake:0,turn:1,
+    bossDead:false,clearDone:false,
+    warnings:[],
+    pitScar:[],
+    flashT:0,teleT:0,
+    secretOpen:false,
+    secretLoot:secretLoot,
+    trapDoorLocked:false,trapDoorAnim:0,
+    trapEnemies:0
+  };
+  DUNGEON.player=makePlayer(MAP.entry.x,MAP.entry.y);
+  TURN.phase="player";TURN.q=null;TURN.i=0;TURN.t=0;TURN.busy=false;TURN.bufferedDir=-1;
+  collectDrops(DUNGEON.player);
+  SAVE.floorsVisited[floor]=true;
+  if(floor>SAVE.maxFloor)SAVE.maxFloor=floor;
+  if(floor%10===0)UI.toast(floor+"F: セーブポイントとワープゲート");
+  // (T37) その階のテーマから3曲中ランダム1曲を選んで保持(同じ階中は同じ曲)
+  // (T58) 死亡後の初回ダンジョン入りのみ「死に戻り」テーマ曲を1回だけ(フラグ消費→以降は従来テーマBGM)
+  if(SAVE.resBgmPending){SAVE.resBgmPending=false;DUNGEON.bgm="bgm_res.ogg";}
+  else DUNGEON.bgm=themeBgmName(floor);
+  playBGM(DUNGEON.bgm);
+  if(!fromGate)playSFX("sfx_stairs.ogg");
+  // (T48) spawn点=上り階段(一階上へ): 2F+では待機で上れるヒントを表示
+  UI.toast(floor+"F "+theme.name+" (ターン制)"+(floor>1?" 待機=上へ":""));
+  if(floor===100)playVoice("voice_boss_in.ogg");
+}
+function spawnEnemy(id,tx,ty,floor){
+  const base=EBY[id];
+  const scale=1+(floor-1)*0.045;
+  const lvBonus=SAVE?1+Math.max(0,SAVE.lv-1)*0.03:1;
+  const hp=Math.floor(base.hp*scale*lvBonus);
+  return {
+    id:id,name:base.name,tx:tx,ty:ty,
+    x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,
+    r:base.r,
+    hp:hp,hpMax:hp,
+    atk:Math.floor(base.atk*(1+(floor-1)*0.03)),
+    def:Math.floor(base.def*(1+(floor-1)*0.02)),
+    spd:base.spd,xp:Math.floor(base.xp*(1+(floor-1)*0.02)),
+    gold:[base.gold[0],base.gold[1]],
+    kind:base.kind,theme:base.theme,col:base.col,
+    dirIdx:4,
+    fireCd:2+Math.floor(Math.random()*2),
+    chargeWarn:null,chargePath:null,
+    hitT:0,freezeT:0,dead:false,animT:Math.random()*6,
+    flying:base.kind==="flying",
+    size:base.size
+  };
+}
+// ============================================================
+// (T41) 中ボス: 10F毎に階段を守る。idle→会話→fight→討伐で解放
+// ============================================================
+function spawnMiniBoss(floor,tx,ty){
+  const def=MBOSSES[floor];
+  const lvBonus=SAVE?1+Math.max(0,SAVE.lv-1)*0.03:1;
+  const hp=Math.floor(def.hp*lvBonus);
+  return {
+    id:def.id,name:def.name,tx:tx,ty:ty,
+    x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,
+    r:def.r,hp:hp,hpMax:hp,
+    atk:Math.floor(def.atk*lvBonus),def:Math.floor(def.def*lvBonus),
+    spd:def.spd,xp:Math.floor(def.xp*lvBonus),gold:def.gold,
+    kind:"boss",theme:Math.min(9,Math.floor((floor-1)/10)),col:def.col,
+    dirIdx:4,fireCd:2,chargeWarn:null,chargePath:null,
+    hitT:0,freezeT:0,dead:false,animT:Math.random()*6,flying:false,
+    size:192,
+    mini:true,mb:MBOSSES[floor],mbState:"idle",atkCd:2,saidMid:false,saidLow:false
+  };
+}
+function mbAlive(){
+  return DUNGEON&&DUNGEON.enemies.some(function(e){return e.mini&&!e.dead;});
+}
+// (T54) ワープゲート=「解放済みゲート階(=中ボス討伐済みの10F帯)↔地上」の自由往来。
+// 解放は SAVE.miniBossDefeated で永続(死亡・リロード後も保持)。
+function gateFloors(){
+  const out=[];
+  if(SAVE.miniBossDefeated)for(let f=10;f<100;f+=10)if(SAVE.miniBossDefeated[f])out.push(f);
+  return out;
+}
+// 隣接のidle中ボスにZ=「話す」(ターン消費) → 台詞+咆哮で戦闘開始
+function mbTalk(e){
+  e.mbState="fight";
+  DUNGEON.miniBossFight=true;
+  const def=e.mb;
+  UI.speech={text:def.open,speaker:def.name,t:4.2};
+  playVoice("mbv_open_"+e.id+".ogg");
+  playSFX("sfx_boss.ogg");
+  DUNGEON.shake=10;
+  DUNGEON.flashT=0.18;
+  for(let i=0;i<26;i++)P(e.x+(Math.random()-0.5)*70,e.y+(Math.random()-0.5)*70,(Math.random()-0.5)*4,(Math.random()-0.5)*4,0.7,def.gender==="m"?"#ff8a3a":"#b8a0ff",3);
+  DUNGEON.warnings=DUNGEON.warnings.filter(function(w){return w.e!==e;}); // 自分以外(他の敵の突進予告)は保持
+  // (T43) 中ボス戦闘=その階の唐揚げ王国崇拝曲(深い階層ほど崇拝度高い)
+  const mbn=mbBgmName(DUNGEON.floor);
+  if(mbn&&DUNGEON.bgm!==mbn){DUNGEON.bgm=mbn;playBGM(mbn);}
+  UI.toast(def.name+" の出現!! (中ボス)");
+}
+// 中ボス討伐: 階段解放+専用武器ドロップ+地上ワープゲート+死亡保持
+function mbDefeated(e){
+  const def=e.mb;
+  const floor=DUNGEON.floor;
+  if(!SAVE.miniBossDefeated)SAVE.miniBossDefeated={};
+  SAVE.miniBossDefeated[floor]=true;
+  storeSave();
+  DUNGEON.miniBossFight=false;
+  // 専用武器(店売りなし)を死体からドロップ
+  DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:def.weapon,n:1,amount:0,bob:0,got:false});
+  UI.toast("専用武器「"+ALL_ITEMS[def.weapon].name+"」を入手可能!");
+  // (T54) ゲートは移動しない: この階のゲートが解放される(元のタイル+町のゲートから使える)。
+  // 直前にゲートに踏んでトーストを見た場合の _gateDone 残留もクリアして即再入を許可
+  DUNGEON._gateDone=false;
+  // BGMを探索曲(テーマ)に戻す
+  if(isMbBgm(DUNGEON.bgm)||DUNGEON.bgm==="bgm_boss.ogg"){DUNGEON.bgm=themeBgmName(floor);playBGM(DUNGEON.bgm);}
+  DUNGEON.shake=12;
+  DUNGEON.flashT=0.25;
+  playSFX("sfx_boss.ogg",0.9);
+  // (T41) 死亡台詞: 共通プール(性別別)・90Fのみ固有(大魔王への祈り)
+  const g=(def.gender==="m"?"m_":"f_");
+  const dieLine=(floor===90)?def.die:MBV_LINES[g+"die"][Math.floor(Math.random()*MBV_LINES[g+"die"].length)];
+  UI.speech={text:dieLine,speaker:def.name,t:4.2};
+  playVoice((floor===90)?"mbv_die_"+e.id+".ogg":"mbv_"+g+"die.ogg");
+  UI.toast(floor+"F の中ボスを討伐! 階段とワープゲートが解放された。");
+}
+function makePlayer(tx,ty){
+  return {
+    tx:tx,ty:ty,
+    x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,
+    r:13,hp:SAVE.hp,mp:SAVE.mp,
+    dirIdx:0,faceX:1,swing:0, // (T53) faceX=体の向き(左右): 上下移動で右にリセットされないようdirIdxと分離
+    skillCd:[0,0,0],
+    hitT:0,guardT:0,dashBonusT:0,
+    flyT:0,flySkillCd:0,
+    summon:null,
+    animT:0,moving:false
+  };
+}
+function makeDrop(tx,ty,floor,rng){
+  const t=rng();
+  let id;
+  if(t<0.34)id="p_hp_s";
+  else if(t<0.50)id="p_mp";
+  else if(t<0.64)id="gold";
+  else if(t<0.80)id="exp";
+  else if(t<0.90)id="s_mat";
+  else if(t<0.96)id="p_hp_l";
+  else id="gold";
+  let n=1,amount=0;
+  if(id==="gold")amount=5+Math.floor(rng()*(8+floor*0.8));
+  if(id==="exp")amount=10+Math.floor(rng()*15+floor*0.5);
+  if(id==="p_hp_s")n=1+Math.floor(rng()*2);
+  return {tx:tx,ty:ty,x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,id:id,n:n,amount:amount,bob:rng()*6,got:false};
+}
+function pickChestItem(floor,rng){
+  const tier=Math.min(6,1+Math.floor(floor/18));
+  const w=WEAPONS.filter(function(it){return it.tier<=tier;});
+  const a=ARMORS.filter(function(it){return it.tier<=tier;});
+  const r=rng();
+  if(r<0.45)return {kind:"weapon",id:w[Math.floor(rng()*w.length)].id};
+  if(r<0.75)return {kind:"armor",id:a[Math.floor(rng()*a.length)].id};
+  if(r<0.90)return {kind:"ring",id:RINGS[Math.floor(rng()*RINGS.length)].id};
+  return {kind:"weapon",id:WEAPONS[Math.min(WEAPONS.length-1,Math.floor(rng()*(tier+1)))].id};
+}
+// 装備: 旧装備はバックパックへ退避
+function addItemEquip(item){
+  const slot=item.kind;
+  const old=SAVE.equip[slot];
+  if(old)SAVE.inv.push({id:old,n:1});
+  SAVE.equip[slot]=item.id;
+  const it=ALL_ITEMS[item.id];
+  if(it)UI.toast("装備: "+it.name);
+}
+function itemSlotOf(def){
+  if(WEAPONS.indexOf(def)>=0)return "weapon";
+  if(ARMORS.indexOf(def)>=0)return "armor";
+  if(RINGS.indexOf(def)>=0)return "ring";
+  return null;
+}
+function equipFromBag(invIdx){
+  const it=SAVE.inv[invIdx];
+  if(!it)return false;
+  const def=ALL_ITEMS[it.id];
+  const realSlot=itemSlotOf(def);
+  if(!realSlot)return false;
+  const old=SAVE.equip[realSlot];
+  SAVE.inv.splice(invIdx,1);
+  if(old)SAVE.inv.push({id:old,n:1});
+  SAVE.equip[realSlot]=it.id;
+  UI.toast("装備: "+def.name);
+  return true;
+}
+// マス占有判定
+function enemyAt(tx,ty){
+  for(const e of DUNGEON.enemies)if(!e.dead&&e.tx===tx&&e.ty===ty)return e;
+  return null;
+}
+function canStep(tx,ty,ignoreEnemy){
+  if(!isFloor(tx,ty))return false;
+  if(DUNGEON.player.tx===tx&&DUNGEON.player.ty===ty)return false;
+  const e=enemyAt(tx,ty);
+  if(e&&!ignoreEnemy)return false;
+  return true;
+}
+function canDiag(ax,ay,bx,by){
+  // (ax,ay)=水平ステップ, (bx,by)=垂直ステップ — 両方が床でないと対角不可
+  return isFloor(ax,ay)&&isFloor(bx,by);
+}
+// 足元のドロップ収集(自由)
+function collectDrops(p){
+  for(const dr of DUNGEON.drops){
+    if(dr.got||dr.tx!==p.tx||dr.ty!==p.ty)continue;
+    dr.got=true;
+    if(dr.id==="gold"){
+      SAVE.gold+=dr.amount;
+      playSFX("sfx_pickup.ogg",1.1);
+      UI.float(p.x,p.y-16,"+"+dr.amount+"G","#ffd24a",13);
+    }else if(dr.id==="exp"){
+      gainXp(dr.amount);
+      playSFX("sfx_pickup.ogg",1.2);
+      UI.float(p.x,p.y-16,"+"+dr.amount+"EXP","#7ec8ff",13);
+    }else{
+      addItem(dr.id,dr.n);
+      // (T38) レアリティ(tier)別入手音
+      const _it=ALL_ITEMS[dr.id];
+      const _tier=_it&&_it.tier?Math.min(6,_it.tier):1;
+      playSFX("sfx_pick_t"+_tier+".ogg");
+    }
+  }
+}
+// 敵フェーズ終了後: 階段に立ち止まっていた場合の判定(100Fのみボス撃破必須)
+// (T48) 上り階段(=入口/spawn)は踏むだけでは無反応(待機/決定操作でgoUpstairs=1階上へ)
+// (T49) 降り階段(=exit)に立っている場合: 自動降下しない → 「降りる/留まる」選択肢を開く
+//        (留まる=階段上に留まったまま次ターンへ。降りるはプレイヤーの選択のみ)
+function checkStairsDescend(){
+  const p=DUNGEON.player;
+  if(p.tx===MAP.exit.x&&p.ty===MAP.exit.y){
+    if(DUNGEON.floor>=100){
+      if(DUNGEON.bossDead)doClear();
+      return;
+    }
+    // (T41) 未討伐の中ボスが居れば階段封じ
+    if(DUNGEON.floor%10===0&&mbAlive()){
+      UI.toast("階段は"+DUNGEON.enemies.filter(function(e){return e.mini&&!e.dead;})[0].name+"が塞いでいる…!");
+      return;
+    }
+    openStairsChoice();
+  }
+}
+function doClear(){
+  G.screen="clear";
+  stopBGM();
+  playBGM("bgm_clear.ogg");
+  playVoice("voice_clear.ogg");
+  playSFX("sfx_victory.ogg");
+  SAVE.cleared=true;
+  // (T49) 耐性: 破損セーブ等の無効装備IDで .legend がクラッシュしない(勝利時=最悪の瞬間)
+  if(!SAVE.equip.weapon||!ALL_ITEMS[SAVE.equip.weapon]||!ALL_ITEMS[SAVE.equip.weapon].legend)SAVE.equip.weapon="w_holy";
+  if(!SAVE.equip.armor||!ALL_ITEMS[SAVE.equip.armor]||!ALL_ITEMS[SAVE.equip.armor].legend)SAVE.equip.armor="a_crown";
+  storeSave();
+}
+
+// ============================================================
+// 戦闘 (ターン制)
+// ============================================================
+function calcMeleeDmg(atk,def){
+  return Math.max(1,Math.floor(atk*(0.85+Math.random()*0.3)-def*0.5));
+}
+// 武器ダメージ: 魔属性中心の武器は魔力計算、それ以外は物理
+function weaponDmg(w,d,e,mult){
+  mult=mult||1;
+  if(w.mag>w.atk){
+    return Math.max(1,Math.floor(d.mag*mult*0.9-e.def*0.4));
+  }
+  return Math.max(1,Math.floor(calcMeleeDmg(d.atk,e.def)*mult));
+}
+// 攻撃種別による攻撃 (T25: 全武器1行動=1ターン。chargeは1T溜め→次のZで発射)
+function attackAction(){
+  const p=DUNGEON.player,d=dStats(),D=DUNGEON;
+  // (T50) 斜め攻撃: 壁を挟む場合(直交マスが片方でも歩けない=斜め移動と同じルール)は攻撃不可。
+  //        ぶつかった音を鳴らして向き変更だけ(ターン消費なし・アニメ/SFX/toastなし)
+  {
+    const dv=DIRS[p.dirIdx];
+    if(dv[0]!==0&&dv[1]!==0&&!(pWalk(p.tx+dv[0],p.ty)&&pWalk(p.tx,p.ty+dv[1]))){
+      playBumpSFX();
+      return;
+    }
+  }
+  const w=SAVE.equip.weapon&&ALL_ITEMS[SAVE.equip.weapon];
+  if(SAVE.job==="hero"&&w){
+    SAVE.mastery[w.id]=(SAVE.mastery[w.id]||0)+0.1;
+  }
+  // (T41) 隣接のidle中ボスにZ=「話す」: ダメージなし、台詞+咆哮で戦闘開始(ターン消費)
+  {
+    const v=DIRS[p.dirIdx];
+    const t=enemyAt(p.tx+v[0],p.ty+v[1]);
+    if(t&&t.mini&&t.mbState==="idle"){
+      p.charging=false;
+      mbTalk(t);
+      endPlayerTurn();
+      return;
+    }
+  }
+  // ---- charge系: 1回押す=溜め(1ターン)、2回押す=発射(1ターン)。移動でキャンセル ----
+  if(w&&w.kind==="charge"){
+    if(!p.charging){
+      p.charging=true;
+      p.swing=0.22;
+      UI.float(p.x,p.y-26,"溜め…","#ffd24a",15);
+      playSFX("sfx_charge.ogg"); // (T38) 溜め音
+      for(let i=0;i<8;i++){
+        const a=i/8*Math.PI*2;
+        P(p.x+Math.cos(a)*20,p.y+Math.sin(a)*20,-Math.cos(a)*1.5,-Math.sin(a)*1.5,0.5,"#ffd24a",2.5);
+      }
+      endPlayerTurn();
+      return;
+    }
+    // 発射
+    p.charging=false;
+    p.swing=0.3;
+    playSFX("sfx_atk_charge.ogg",1.15); // (T38) 溜め武器発射音
+    if(w.thunder){
+      // 雷鳴の槌: 周囲半径w.boomの落雷
+      let hitAny=false;
+      for(const e of D.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=w.boom){
+          damageEnemy(e,weaponDmg(w,d,e));
+          e.freezeT=Math.max(e.freezeT,1);
+          spawnLightningFX(e.x,e.y);
+          hitAny=true;
+        }
+      }
+      D.shake=14;
+      playSFX(hitAny?"sfx_hit.ogg":"sfx_swing.ogg",1.1);
+      UI.float(p.x,p.y-30,"雷鳴!!","#ffe24a",16);
+    }else{
+      // 波動砲: 向きの直線w.rangeマスの全貫通
+      const v=DIRS[p.dirIdx];
+      let hitAny=false,last=null;
+      for(let k=1;k<=w.range;k++){
+        const nx=p.tx+v[0]*k,ny=p.ty+v[1]*k;
+        if(!isFloor(nx,ny))break;
+        const e=enemyAt(nx,ny);
+        if(e){damageEnemy(e,weaponDmg(w,d,e));hitAny=true;last=e;}
+      }
+      D.beams.push({x0:p.x,y0:p.y,x1:(p.tx+v[0]*Math.min(w.range,8)+0.5)*TILE,y1:(p.ty+v[1]*Math.min(w.range,8)+0.5)*TILE,life:0.18,max:0.18,col:"#8ae8ff",w:10});
+      D.shake=12;
+      playSFX(hitAny?"sfx_hit.ogg":"sfx_swing.ogg",1.1);
+      UI.float(p.x,p.y-30,"波動砲!!","#8ae8ff",16);
+    }
+    endPlayerTurn();
+    return;
+  }
+  // (T38) 武器kind別発動音(素手はmelee音)
+  const ATK_SFX={melee:"sfx_atk_melee.ogg",wide:"sfx_atk_wide.ogg",pierce:"sfx_atk_pierce.ogg",shot:"sfx_atk_shot.ogg",multi:"sfx_atk_multi.ogg",bomb:"sfx_atk_bomb.ogg",flash:"sfx_atk_flash.ogg"};
+  if(w&&ATK_SFX[w.kind])playSFX(ATK_SFX[w.kind],1.0);
+  else if(!w)playSFX("sfx_atk_melee.ogg",0.9);
+  let hitAny=false;
+  if(!w||!w.kind){
+    // 素手: 向きの1マス
+    const v=DIRS[p.dirIdx];
+    const e=enemyAt(p.tx+v[0],p.ty+v[1]);
+    if(e){damageEnemy(e,calcMeleeDmg(d.atk,e.def));hitAny=true;}
+  }else if(w.kind==="melee"){
+    const v=DIRS[p.dirIdx];
+    const e=enemyAt(p.tx+v[0],p.ty+v[1]);
+    if(e){
+      damageEnemy(e,weaponDmg(w,d,e));
+      if(w.stagger&&Math.random()<w.stagger){e.freezeT=1;UI.float(e.x,e.y-e.r-8,"怯え","#c8d8ff",12);D.shake=Math.max(D.shake,4);}
+      if(w.followup&&Math.random()<w.followup){
+        damageEnemy(e,Math.max(1,Math.floor(weaponDmg(w,d,e)*0.5)));
+        UI.float(e.x,e.y-e.r-16,"追撃!","#ffd24a",13);
+      }
+      hitAny=true;
+    }
+  }else if(w.kind==="wide"){
+    // 正面+両斜め(3マスの弧)
+    const dirs=[(p.dirIdx+7)%8,p.dirIdx,(p.dirIdx+1)%8];
+    for(const di of dirs){
+      const v=DIRS[di];
+      const e=enemyAt(p.tx+v[0],p.ty+v[1]);
+      if(e){damageEnemy(e,weaponDmg(w,d,e));hitAny=true;}
+    }
+  }else if(w.kind==="pierce"){
+    // 直線Nマス・全貫通
+    const v=DIRS[p.dirIdx];
+    let lastK=1;
+    for(let k=1;k<=w.range;k++){
+      const nx=p.tx+v[0]*k,ny=p.ty+v[1]*k;
+      if(!isFloor(nx,ny))break;
+      lastK=k;
+      const e=enemyAt(nx,ny);
+      if(e){damageEnemy(e,weaponDmg(w,d,e));hitAny=true;}
+    }
+    if(w.beam&&hitAny){
+      D.beams.push({x0:p.x,y0:p.y,x1:(p.tx+v[0]*lastK+0.5)*TILE,y1:(p.ty+v[1]*lastK+0.5)*TILE,life:0.15,max:0.15,col:"#ff5af0",w:6});
+      D.shake=Math.max(D.shake,5);
+    }
+  }else if(w.kind==="shot"||w.kind==="multi"){
+    // 投射弾(敵フェーズで1マスずつ進み初命中): shot=1方向, multi=3方向
+    const dirs=w.kind==="multi"?[(p.dirIdx+7)%8,p.dirIdx,(p.dirIdx+1)%8]:[p.dirIdx];
+    for(const di of dirs){
+      const v=DIRS[di];
+      const nx=p.tx+v[0],ny=p.ty+v[1];
+      const shots=w.kind==="multi"?1:(w.shots||1);
+      for(let s=0;s<shots;s++){
+        if(isFloor(nx,ny)&&!enemyAt(nx,ny)){
+          D.pbullets.push({tx:p.tx,ty:p.ty,x:p.x,y:p.y,dx:v[0],dy:v[1],w:w,mult:w.mult||1,col:w.mag>w.atk?"#8ae8ff":"#ffd24a",boom:0});
+          hitAny=true;
+        }else{
+          // 至近距離(隣が敵): 即時命中
+          const e=enemyAt(nx,ny);
+          if(e){damageEnemy(e,weaponDmg(w,d,e,w.mult||1));hitAny=true;}
+        }
+      }
+    }
+    playSFX("sfx_hit.ogg",0.8);
+    spawnMuzzleFX(p.x,p.y,dirAngle(p.dirIdx),w.mag>w.atk?"#8ae8ff":"#ffd24a");
+  }else if(w.kind==="bomb"){
+    // 投射→Nマス目に着弾してAoE爆発
+    const v=DIRS[p.dirIdx];
+    let landK=1;
+    for(let k=1;k<=w.range;k++){
+      const nx=p.tx+v[0]*k,ny=p.ty+v[1]*k;
+      if(!isFloor(nx,ny))break;
+      landK=k;
+    }
+    const ltx=p.tx+v[0]*landK,lty=p.ty+v[1]*landK;
+    D.pbullets.push({tx:p.tx,ty:p.ty,x:p.x,y:p.y,dx:v[0],dy:v[1],w:w,mult:w.mult||1,col:"#ff9a4a",boom:w.boom,pull:w.pull||0,dist:0,maxDist:landK});
+    hitAny=true;
+    playSFX("sfx_hit.ogg",0.8);
+    spawnMuzzleFX(p.x,p.y,dirAngle(p.dirIdx),"#ff9a4a");
+  }else if(w.kind==="flash"){
+    // 周囲半径w.rangeの眩光+麻痺
+    let hitAny=false;
+    for(const e of D.enemies){
+      if(e.dead)continue;
+      if(chebyshev(e,p)<=w.range){
+        damageEnemy(e,weaponDmg(w,d,e));
+        e.freezeT=Math.max(e.freezeT,w.stun||2);
+        hitAny=true;
+      }
+    }
+    D.flashT=0.25;
+    D.shake=Math.max(D.shake,6);
+    playSFX(hitAny?"sfx_hit.ogg":"sfx_swing.ogg",1.0);
+    for(let i=0;i<14;i++)P(p.x+(Math.random()-0.5)*40,p.y+(Math.random()-0.5)*40,(Math.random()-0.5)*2,(Math.random()-0.5)*2,0.5,"#fffbe0",2.5);
+  }
+  p.swing=Math.max(p.swing||0,w&&w.kind==="melee"?0.22:0.15);
+  if(!hitAny)playSFX("sfx_swing.ogg");
+  spawnArcFX(p.x,p.y,dirAngle(p.dirIdx),hitAny);
+  endPlayerTurn();
+}
+// 爆発(AoE): bomb系とブラックホール共用
+function bombExplosion(b){
+  const D=DUNGEON;
+  const R=b.boom||1;
+  let hitAny=false;
+  for(const e of D.enemies){
+    if(e.dead)continue;
+    if(chebyshev(e,{tx:b.tx,ty:b.ty})<=R){
+      damageEnemy(e,weaponDmg(b.w,dStats(),e,b.mult||1));
+      hitAny=true;
+    }
+  }
+  if(b.pull){
+    // 吸い込み: 周囲(b.boom+1)の敵を爆心へ1マス引き寄せる
+    for(const e of D.enemies){
+      if(e.dead)continue;
+      const dc=chebyshev(e,{tx:b.tx,ty:b.ty});
+      if(dc<=R+1&&dc>0){
+        const di=dirTo(e.tx,e.ty,b.tx,b.ty);
+        const v=DIRS[di];
+        const nx=e.tx+v[0],ny=e.ty+v[1];
+        if(isFloor(nx,ny)&&!enemyAt(nx,ny)&&!(D.player.tx===nx&&D.player.ty===ny)){
+          e.tx=nx;e.ty=ny;
+        }
+      }
+    }
+  }
+  D.shake=Math.max(D.shake,b.pull?12:9);
+  playSFX("sfx_ehit.ogg",1.2);
+  for(let i=0;i<16;i++){
+    const a=Math.random()*Math.PI*2,sp=1+Math.random()*3;
+    P((b.tx+0.5)*TILE,(b.ty+0.5)*TILE,Math.cos(a)*sp,Math.sin(a)*sp,0.6,b.pull?"#c33bd4":"#ff9a4a",3);
+  }
+  tileFlash(b.tx,b.ty,b.pull?"rgba(160,60,220,":"rgba(255,150,60,");
+}
+// 銃口スパーク
+function spawnMuzzleFX(x,y,ang,col){
+  for(let i=0;i<5;i++){
+    const a=ang+(Math.random()-0.5)*0.8;
+    P(x+Math.cos(ang)*14,y+Math.sin(ang)*14,Math.cos(a)*2.5,Math.sin(a)*2.5,0.3,col||"#ffd24a",2);
+  }
+}
+function damageEnemy(e,dmg){
+  if(e.dead)return;
+  // (T41) idle中ボスへの攻撃=挑発: 最初の攻撃は無効、会話で戦闘開始
+  if(e.mini&&e.mbState==="idle"){
+    mbTalk(e);
+    UI.float(e.x,e.y-e.r-10,"挑発!","#ffd24a",14);
+    return;
+  }
+  e.hp-=dmg;e.hitT=0.18;
+  UI.float(e.x,e.y-e.r-6,"-"+dmg,"#ffd24a",14);
+  spawnHitFX(e.x,e.y);
+  if(e.hp<=0)killEnemy(e);
+}
+function killEnemy(e){
+  e.dead=true;
+  playSFX("sfx_ehit.ogg",0.9);
+  spawnDeathFX(e.x,e.y,e.col);
+  const g=e.gold[0]+Math.floor(Math.random()*(e.gold[1]-e.gold[0]+1));
+  DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:"gold",n:1,amount:g,bob:0,got:false});
+  DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:"exp",n:1,amount:e.xp,bob:0,got:false});
+  if(Math.random()<0.12)DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:"p_hp_s",n:1,amount:0,bob:0,got:false});
+  if(e.id==="mimic"){
+    // ミミック討伐報酬: 高ティア装備+大金塊
+    const item=pickChestItem(Math.min(100,DUNGEON.floor+15),Math.random);
+    addItemEquip(item);
+    UI.toast("ミミックを倒した! "+ALL_ITEMS[item.id].name+" を得た!");
+    DUNGEON.drops.push({tx:e.tx,ty:e.ty,x:e.x,y:e.y,id:"gold",n:1,amount:100+DUNGEON.floor*6,bob:0,got:false});
+  }
+  // (T41) 中ボス討伐: 階段解放+専用武器+地上ゲート+死亡保持
+  if(e.mini)mbDefeated(e);
+  gainXp(Math.floor(e.xp*0.5));
+  checkTrapRoomUnlock();
+  if(e.id==="boss_karaage"){
+    DUNGEON.bossDead=true;
+    SAVE.bossDown=true;
+    playSFX("sfx_boss.ogg");
+    playVoice("voice_boss_die.ogg");
+    DUNGEON.shake=14;
+  }
+}
+function damagePlayer(dmg){
+  const p=DUNGEON.player;
+  if(!p||G.screen!=="dungeon")return;
+  if(p.guardT>0){
+    dmg=Math.max(1,Math.floor(dmg*0.25));
+    playSFX("sfx_guard.ogg");
+    spawnGuardFX(p.x,p.y);
+  }
+  const d=dStats();
+  const real=Math.max(1,Math.floor(dmg-d.def*0.6));
+  p.hp-=real;
+  SAVE.hp=p.hp;
+  p.hitT=0.25;
+  DUNGEON.shake=6;
+  playSFX("sfx_ehit.ogg",1.1);
+  UI.float(p.x,p.y-20,"-"+real,"#ff5a5a",16);
+  spawnHitFX(p.x,p.y);
+  if(p.hp<=0){p.hp=0;SAVE.hp=0;onDeath();}
+}
+// (T57) おばあさんの死亡セリフ(「倒れた…」画面上で再生。笑い行=ユーザー指示で廃止)
+function playGrandmaDie(){
+  playVoice("voice_grandma_die.ogg");
+}
+function onDeath(){
+  stopBGM();
+  playSFX("sfx_death.ogg");
+  SAVE.gold=0;
+  SAVE.equip={weapon:null,armor:null,ring:null};
+  SAVE.inv=[];
+  // (T57) HP/MP全回復で町へ戻る(宿屋「火」の全回復と同一。死亡してMP0で戻る不自然さを回避)
+  const d=dStats();
+  SAVE.hp=d.hpMax;SAVE.mp=d.mpMax;
+  // (T58) 「死に戻り」BGM: 死亡後の次のダンジョン入りのみ1回だけ流す
+  SAVE.resBgmPending=true;
+  storeSave();
+  G.screen="gameover";
+  UI.gameoverReason="全ての装備・金・アイテムを失った…(レベルと解放した階は保持。HPは全回復)";
+  playGrandmaDie();
+}
+function useSkill(i){
+  const p=DUNGEON.player;
+  if(!p)return;
+  const sk=JOBS[SAVE.job].skills[i];
+  if(!sk)return;
+  // スキル使用で溜めはキャンセル(古代の装甲でも)
+  if(p.charging){p.charging=false;UI.toast("溜めが切れた");}
+  if(p.skillCd[i]>0||p.mp<sk.mp)return;
+  p.mp-=sk.mp;
+  SAVE.mp=p.mp;
+  p.skillCd[i]=sk.cd;
+  const d=dStats();
+  if(SAVE.job==="hero"){
+    if(i===0){
+      const v=DIRS[p.dirIdx];
+      const e=enemyAt(p.tx+v[0],p.ty+v[1]);
+      if(e){
+        damageEnemy(e,Math.max(1,Math.floor(d.atk*2.2-e.def*0.5)));
+        DUNGEON.shake=11;
+        DUNGEON.beams.push({x0:p.x,y0:p.y,x1:p.x+v[0]*52,y1:p.y+v[1]*52,life:0.2,max:0.2,col:"#9fe8ff",w:9}); // (T39) 光帯
+      }
+      playSFX("sfx_skill.ogg");
+      spawnArcFX(p.x,p.y,dirAngle(p.dirIdx),true);
+      for(let k=0;k<8;k++){ // (T39) 粒子増大
+        const a=dirAngle(p.dirIdx)+(Math.random()-0.5)*2.4,sp=(4+Math.random()*4);
+        P(p.x+Math.cos(a)*14,p.y+Math.sin(a)*14,Math.cos(a)*sp,Math.sin(a)*sp,0.3,"#fff2c8",2.5);
+      }
+    }else if(i===1){
+      const v=DIRS[p.dirIdx];
+      let moved=0;
+      for(let k=1;k<=3;k++){
+        const nx=p.tx+v[0]*k,ny=p.ty+v[1]*k;
+        if(!isFloor(nx,ny)||enemyAt(nx,ny))break;
+        p.tx=nx;p.ty=ny;moved=k;
+        P((p.x),p.y,0,0,0.25,"rgba(138,232,255,.55)",8+4*k,{ring:true,lw:2}); // (T39) 突進尾輪
+      }
+      if(moved){UI.float(p.x,p.y-24,"突進!","#8ae8ff",14);DUNGEON.shake=Math.max(DUNGEON.shake,4);}
+      playSFX("sfx_skill.ogg");
+    }else{
+      // (T39) 必殺: 天翔り双月斬 — 周囲2全敵 atk×3.5+怯え2T
+      playVoice("voice_hero_ult.ogg");
+      playSFX("sfx_skill.ogg",1.05);
+      DUNGEON.shake=16;
+      let hitAny=false;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=2){
+          damageEnemy(e,Math.max(1,Math.floor(d.atk*3.5-e.def*0.5)));
+          e.freezeT=Math.max(e.freezeT,2);
+          hitAny=true;
+        }
+      }
+      // 大円環斬撃光帯
+      for(let k=0;k<28;k++){
+        const a=k/28*Math.PI*2;
+        P(p.x+Math.cos(a)*46,p.y+Math.sin(a)*46,Math.cos(a)*2.6,Math.sin(a)*2.6,0.45,"#9fe8ff",3);
+      }
+      P(p.x,p.y,0,0,0.5,"rgba(159,232,255,.9)",48,{ring:true,lw:5});
+      P(p.x,p.y,0,0,0.42,"rgba(255,226,122,.9)",32,{ring:true,lw:4});
+      // 月面2枚
+      P(p.x-24,p.y-10,3.4,-1.4,0.5,"#ffe27a",11);
+      P(p.x+24,p.y+10,-3.4,1.4,0.5,"#cfe8ff",11);
+      UI.float(p.x,p.y-30,"天翔り双月斬!!","#9fe8ff",17);
+    }
+  }else if(SAVE.job==="paladin"){
+    if(i===0){
+      const dmg=d.mag*2.4;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=1){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+        }
+      }
+      DUNGEON.shake=8;playSFX("sfx_skill.ogg");spawnHolyFX(p.x,p.y,true); // (T39) FX強化
+      DUNGEON.beams.push({x0:p.x,y0:p.y-70,x1:p.x,y1:p.y+8,life:0.3,max:0.3,col:"#fff8d0",w:12}); // 光柱
+    }else if(i===1){
+      p.guardT=1;
+      playSFX("sfx_guard.ogg");spawnGuardFX(p.x,p.y);
+      P(p.x,p.y,0,0,0.4,"rgba(138,232,255,.8)",24,{ring:true,lw:3}); // (T39) 盾輪
+      UI.float(p.x,p.y-24,"神聖の盾","#8ae8ff",14);
+    }else{
+      // (T39) 必殺: 神聖裁き・光の審判 — 周囲2 mag×3.0聖爆+自身HP15%治癒
+      playVoice("voice_paladin_ult.ogg");
+      playSFX("sfx_skill.ogg",1.05);
+      DUNGEON.shake=14;
+      DUNGEON.flashT=0.3; // 白フラッシュ
+      const dmg=d.mag*3.0;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=2){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+        }
+      }
+      // 光柱+天使の輪
+      DUNGEON.beams.push({x0:p.x,y0:p.y-150,x1:p.x,y1:p.y+12,life:0.5,max:0.5,col:"#fff8d0",w:26});
+      P(p.x,p.y-18,0,0,0.6,"rgba(255,248,208,.95)",34,{ring:true,lw:5});
+      P(p.x,p.y-18,0,0,0.5,"rgba(255,248,208,.7)",22,{ring:true,lw:3});
+      for(let k=0;k<26;k++){
+        const a=Math.random()*Math.PI*2,sp=3+Math.random()*4;
+        P(p.x,p.y-20,Math.cos(a)*sp,Math.sin(a)*sp*0.5-1.2,0.7,"#fffbe8",3);
+      }
+      const heal=Math.floor(d.hpMax*0.15);
+      p.hp=Math.min(d.hpMax,p.hp+heal);SAVE.hp=p.hp;
+      spawnHealFX(p.x,p.y);
+      UI.float(p.x,p.y-30,"神聖裁き・光の審判!!","#fff8d0",17);
+      if(heal>0)UI.float(p.x,p.y-6,"+"+heal,"#5aff8a",13);
+    }
+  }else if(SAVE.job==="mage"){
+    SAVE.magicXp=Math.min(10,SAVE.magicXp+0.2);
+    if(i===0){
+      // 直線6マス・火球(初命中)
+      const v=DIRS[p.dirIdx];
+      let hitE=null;
+      for(let k=1;k<=6;k++){
+        const nx=p.tx+v[0]*k,ny=p.ty+v[1]*k;
+        if(!isFloor(nx,ny))break;
+        const e=enemyAt(nx,ny);
+        if(e){hitE=e;break;}
+      }
+      if(hitE){
+        damageEnemy(hitE,Math.max(1,Math.floor(d.mag*1.6-hitE.def*0.4)));
+        spawnFireBallFX(hitE);
+        DUNGEON.shake=Math.max(DUNGEON.shake,4); // (T39)
+        DUNGEON.beams.push({x0:p.x,y0:p.y,x1:hitE.x,y1:hitE.y,life:0.16,max:0.16,col:"#ff8a2e",w:5}); // 火球光帯
+      }
+      playSFX("sfx_skill.ogg");
+    }else if(i===1){
+      let hitAny=false;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=1){
+          damageEnemy(e,Math.max(1,Math.floor(d.mag*1.5-e.def*0.4)));
+          e.freezeT=2;
+          hitAny=true;
+        }
+      }
+      DUNGEON.shake=Math.max(DUNGEON.shake,hitAny?5:2); // (T39)
+      playSFX("sfx_skill.ogg");spawnIceFX(p.x,p.y);
+      P(p.x,p.y,0,0,0.45,"rgba(191,232,255,.85)",34,{ring:true,lw:3}); // (T39) 氷輪
+    }else{
+      // (T39) 必殺: 星霜滅尽 — 周囲3 mag×4.0爆発+凍結1T
+      playVoice("voice_mage_ult.ogg");
+      playSFX("sfx_skill.ogg",0.95);
+      DUNGEON.shake=15;
+      DUNGEON.flashT=0.28; // 白
+      DUNGEON.teleT=0.55;  // →紫遷移
+      const dmg=d.mag*4.0;
+      let hitAny=false;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=3){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+          e.freezeT=Math.max(e.freezeT,1);
+          hitAny=true;
+        }
+      }
+      // 星砕け大爆発+渦(収束リング3重)
+      for(let ring=0;ring<3;ring++){
+        for(let k=0;k<16;k++){
+          const a=k/16*Math.PI*2+ring*0.4;
+          const rr=66-ring*16;
+          P(p.x+Math.cos(a)*rr,p.y+Math.sin(a)*rr,-Math.cos(a)*2.6,-Math.sin(a)*2.6,0.6,"#cfe8ff",3);
+        }
+      }
+      for(let k=0;k<22;k++){
+        const a=Math.random()*Math.PI*2,sp=5+Math.random()*5;
+        P(p.x,p.y,Math.cos(a)*sp,Math.sin(a)*sp,0.55,"#b07aff",4);
+      }
+      UI.float(p.x,p.y-30,"星霜滅尽!!","#cfe8ff",18);
+    }
+  }else if(SAVE.job==="summoner"){
+    if(i===0){
+      if(p.summon){UI.toast("すでに召喚済み");p.mp+=sk.mp;SAVE.mp=p.mp;return;}
+      if(!Object.keys(SAVE.summons).length)SAVE.summons["summon_ken"]=1;
+      const sid=Object.keys(SAVE.summons)[0];
+      const st=SAVE.summons[sid];
+      const sdef=SUMMON_BY[sid];
+      const hpMul=SUM_STAGE.hp[st-1],atkMul=SUM_STAGE.atk[st-1];
+      // 隣接の空きマスに出現
+      let sx=p.tx,sy=p.ty;
+      for(let k=0;k<8&&!isSummonSpot(sx,sy);k++){
+        const v=DIRS[k];
+        if(isFloor(p.tx+v[0],p.ty+v[1])&&!enemyAt(p.tx+v[0],p.ty+v[1])){sx=p.tx+v[0];sy=p.ty+v[1];}
+      }
+      p.summon={id:sid,stage:st,tx:sx,ty:sy,x:(sx+0.5)*TILE,y:(sy+0.5)*TILE,dirIdx:p.dirIdx,
+        hp:40*hpMul,hpMax:40*hpMul,atk:8*atkMul,fireCd:1,animT:0,ai:sdef.ai,atkBuffT:0,actT:0};
+      playSFX("sfx_summon.ogg");
+      UI.toast(sdef.name+" を召喚! (段階"+st+")");
+      spawnSummonFX((sx+0.5)*TILE,(sy+0.5)*TILE,sdef.col);
+      P((sx+0.5)*TILE,(sy+0.5)*TILE,0,0,0.5,"rgba(255,207,106,.7)",26,{ring:true,lw:3}); // (T39)
+    }else if(i===1){
+      if(!p.summon){UI.toast("召喚獣がいない");p.mp+=sk.mp;SAVE.mp=p.mp;return;}
+      p.summon.hp=p.summon.hpMax;
+      p.summon.atkBuffT=3;
+      playSFX("sfx_summon.ogg");
+      spawnSummonFX(p.summon.x,p.summon.y,"#ffcf6a"); // (T39) FX強化
+      P(p.summon.x,p.summon.y,0,0,0.5,"rgba(255,207,106,.85)",22,{ring:true,lw:4});
+      UI.toast("獣が力を取り戻した!(3ターン強化)");
+    }else{
+      // (T39) 必殺: 百獣総出・獣神降臨 — 獣が周囲2全敵にmag×2.5総攻撃+獣強化3T
+      if(!p.summon){UI.toast("召喚獣がいない");p.mp+=sk.mp;SAVE.mp=p.mp;return;}
+      playVoice("voice_summoner_ult.ogg");
+      playSFX("sfx_skill.ogg",0.95);
+      DUNGEON.shake=12;
+      const dmg=d.mag*2.5;
+      let hitAny=false;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=2){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+          hitAny=true;
+        }
+      }
+      p.summon.atkBuffT=Math.max(p.summon.atkBuffT,3);
+      // 獣の霊影乱舞(登録済み獣すべてが霊影として旋回)
+      const sids=Object.keys(SAVE.summons);
+      sids.forEach(function(sid,si){
+        const sdef=SUMMON_BY[sid];
+        const a=si/Math.max(1,sids.length)*Math.PI*2;
+        P(p.x+Math.cos(a)*42,p.y+Math.sin(a)*42,-Math.cos(a)*3,-Math.sin(a)*3,0.7,(sdef&&sdef.col)||"#ffcf6a",5);
+      });
+      P(p.summon.x,p.summon.y,0,0,0.55,"rgba(255,207,106,.85)",28,{ring:true,lw:4});
+      UI.float(p.x,p.y-30,"百獣総出・獣神降臨!!","#ffcf6a",16);
+      UI.float(p.x,p.y-8,"咆哮!!","#ff9a4a",15);
+    }
+  }else if(SAVE.job==="unjob"){
+    if(i===0){
+      const dmg=d.atk*1.6+d.mag*1.2;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=1){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.4)));
+        }
+      }
+      DUNGEON.shake=Math.max(DUNGEON.shake,6); // (T39)
+      playSFX("sfx_skill.ogg");spawnArcFX(p.x,p.y,dirAngle(p.dirIdx),true);
+      DUNGEON.beams.push({x0:p.x,y0:p.y,x1:p.x+Math.cos(dirAngle(p.dirIdx))*50,y1:p.y+Math.sin(dirAngle(p.dirIdx))*50,life:0.18,max:0.18,col:"#ff8a8a",w:5});
+    }else if(i===1){
+      p.dashBonusT=2;
+      playSFX("sfx_skill.ogg");
+      for(let k=0;k<12;k++){ // (T39) 乱舞の残像
+        const a=Math.random()*Math.PI*2,sp=2+Math.random()*3;
+        P(p.x+Math.cos(a)*14,p.y+Math.sin(a)*14,Math.cos(a)*sp,Math.sin(a)*sp,0.4,"#ff5a5a",2.5);
+      }
+      UI.float(p.x,p.y-24,"無双乱舞!","#ff5a5a",14);
+    }else{
+      // (T39) 必殺: 無双・万象崩し — 周囲2 (atk+mag)×3.0複合爆発
+      playVoice("voice_unjob_ult.ogg");
+      playSFX("sfx_skill.ogg",1.05);
+      DUNGEON.shake=18;
+      DUNGEON.warpT=0.6; // スクリーン歪み
+      DUNGEON.flashT=0.15;
+      const dmg=(d.atk+d.mag)*3.0;
+      for(const e of DUNGEON.enemies){
+        if(e.dead)continue;
+        if(chebyshev(e,p)<=2){
+          damageEnemy(e,Math.max(1,Math.floor(dmg-e.def*0.3)));
+        }
+      }
+      // 8方向斬撃線+大爆発
+      for(let k=0;k<8;k++){
+        const a=k/8*Math.PI*2;
+        DUNGEON.beams.push({x0:p.x,y0:p.y,x1:p.x+Math.cos(a)*92,y1:p.y+Math.sin(a)*92,life:0.35,max:0.35,col:k%2?"#ff5a5a":"#ffd24a",w:6});
+      }
+      for(let k=0;k<30;k++){
+        const a=Math.random()*Math.PI*2,sp=4+Math.random()*6;
+        P(p.x,p.y,Math.cos(a)*sp,Math.sin(a)*sp,0.6,k%3?"#ff5a5a":"#ffd24a",4);
+      }
+      P(p.x,p.y,0,0,0.5,"rgba(255,90,90,.8)",42,{ring:true,lw:5});
+      UI.float(p.x,p.y-30,"無双・万象崩し!!","#ff5a5a",18);
+    }
+  }
+  endPlayerTurn();
+}
+function chebyshev(a,b){return Math.max(Math.abs(a.tx-b.tx),Math.abs(a.ty-b.ty));}
+function isSummonSpot(tx,ty){return isFloor(tx,ty)&&!enemyAt(tx,ty)&&!(DUNGEON.player.tx===tx&&DUNGEON.player.ty===ty);}
+function spawnFireBallFX(e){
+  for(let i=0;i<12;i++){
+    const a=Math.random()*Math.PI*2,sp=3*Math.random();
+    P(e.x,e.y,Math.cos(a)*sp,Math.sin(a)*sp,0.4,"#ff8a2e",3);
+  }
+}
+
+// ============================================================
+// ターン進行
+// ============================================================
+function moveKeyHeld(){
+  return key("KeyA","ArrowLeft")||key("KeyD","ArrowRight")||key("KeyW","ArrowUp")||key("KeyS","ArrowDown");
+}
+function moveKeyEdge(){
+  return keyP("KeyA","ArrowLeft")||keyP("KeyD","ArrowRight")||keyP("KeyW","ArrowUp")||keyP("KeyS","ArrowDown");
+}
+function endPlayerTurn(consumed,isWait){
+  if(consumed===undefined)consumed=true;
+  const p=DUNGEON.player;
+  const wasMoving=p.moving;
+  DUNGEON.turn++;
+  if(consumed){
+    p.mp=Math.min(dStats().mpMax,p.mp+2);
+    SAVE.mp=p.mp;
+    for(let i=0;i<3;i++)if(p.skillCd[i]>0)p.skillCd[i]--;
+    if(p.guardT>0)p.guardT--;
+    if(p.dashBonusT>0)p.dashBonusT--;
+    if(p.flySkillCd>0)p.flySkillCd--;
+    if(p.flyT>0){p.flyT--;if(p.flyT===0)UI.toast("飛翔の力が切れた…");}
+    if(p.summon&&p.summon.atkBuffT>0)p.summon.atkBuffT--;
+  }
+  p.moving=false;
+  TURN.phase="anim";
+  // 移動キー長押し中の連続移動: anim待機を短縮して次の1歩を即開始(攻撃等は従来どおり)
+  TURN.t=consumed?((wasMoving&&moveKeyHeld())?0.05:0.16):0.05;
+  TURN.toEnemy=consumed;
+  // 毒ガス: ターン消費行動ごとに、そのマスにいるならダメージ
+  if(consumed&&G.screen==="dungeon")stepOnPoison();
+  // (T48) 上り階段: 入口(spawn)マス=上り階段。そこでの**待機**(Space/待機ボタン)のみ一階上へ。
+  // 攻撃・スキル・アイテム等で上らない(意図しない離脱防止)。単に立っているだけは何もしない(降下ループ防止)
+  if(consumed&&isWait&&G.screen==="dungeon"&&MAP.upstairs&&p.tx===MAP.upstairs.x&&p.ty===MAP.upstairs.y){
+    goUpstairs();
+    return;
+  }
+}
+function updateTurn(dt){
+  const D=DUNGEON;
+  if(!D||!D.player||G.screen!=="dungeon")return;
+  // 移動Tween(常時: 画面表示中でも滑らかに)
+  if(!G.paused)tweenEntities(dt);
+  // 待機/整理/ポーズ中(＋T49: 階段の選択肢表示中)はターン進行しない
+  if(G.paused||UI.bag||UI.gate||UI.stairs||UI.help)return;
+  // (T46) watchdog: anim/enemyフェーズが2秒以上復帰しない=ターン機構が詰まった
+  // (正常はanim最大0.16s+enemy最大0.08sで解決。詰まると「移動が止まる」症状になる)
+  // → 強制的にplayerへ復帰してゲームを継続させる(原因フェーズはconsoleに記録)
+  if(TURN.phase==="anim"||TURN.phase==="enemy"){
+    TURN._stallT=(TURN._stallT||0)+dt;
+    if(TURN._stallT>2){
+      try{console.warn("[turn-watchdog] phase="+TURN.phase+" が"+TURN._stallT.toFixed(1)+"s停滞 → playerへ復帰");}catch(e){}
+      TURN._stallT=0;
+      TURN.phase="player";
+    }
+  }else{
+    TURN._stallT=0;
+  }
+  if(TURN.phase==="player"){
+    handlePlayerInput();
+  }else if(TURN.phase==="anim"){
+    // フェーズ待ち中に"押した瞬間"の移動をバッファ(復帰時に即実行。押したままは復帰後のキー走査が引継ぐ)
+    if(TURN.bufferedDir<0&&moveKeyEdge()){
+      let mx=0,my=0;
+      if(key("KeyA","ArrowLeft"))mx-=1;
+      if(key("KeyD","ArrowRight"))mx+=1;
+      if(key("KeyW","ArrowUp"))my-=1;
+      if(key("KeyS","ArrowDown"))my+=1;
+      TURN.bufferedDir=dirIndex(mx,my);
+    }
+    TURN.t-=dt;
+    if(TURN.t<=0){
+      if(TURN.toEnemy){
+        TURN.phase="enemy";
+        TURN.q=D.enemies.filter(function(e){return !e.dead;});
+        TURN.i=0; // 初回tickで全敵一斉行動(バッチ)
+        TURN.t=0;
+      }else{
+        TURN.phase="player";
+      }
+    }
+  }else if(TURN.phase==="enemy"){
+    if(TURN.bufferedDir<0&&moveKeyEdge()){
+      let mx=0,my=0;
+      if(key("KeyA","ArrowLeft"))mx-=1;
+      if(key("KeyD","ArrowRight"))mx+=1;
+      if(key("KeyW","ArrowUp"))my-=1;
+      if(key("KeyS","ArrowDown"))my+=1;
+      TURN.bufferedDir=dirIndex(mx,my);
+    }
+    if(TURN.i===0){
+      // 一斉バッチ: 全敵+敵弾を同一tickで解決(各敵が見る状態は従来と同一。位置は同一フレームで確定→Tween同時開始)
+      for(let j=0;j<TURN.q.length;j++){
+        const e=TURN.q[j];
+        if(!e.dead)enemyAct(e);
+        if(G.screen!=="dungeon")break; // プレイヤー死亡等で中断
+      }
+      moveEbullets();
+      movePbullets();
+      D.enemies=D.enemies.filter(function(e){return !e.dead;});
+      D.drops=D.drops.filter(function(dr){return !dr.got;});
+      // 警告は突進実行まで残す(死んだ敵の分だけ掃除)
+      D.warnings=D.warnings.filter(function(w){return !w.e||(!w.e.dead&&w.e.chargeWarn);});
+      TURN.i=1;
+      TURN.t=TURN.q.length?0.08:0; // 一斉行動後の読取り時間(敵0体: 省略)
+    }else{
+      TURN.t-=dt;
+      if(TURN.t<=0){
+        TURN.phase="player";
+        D._summonPending=true;
+        if(G.screen==="dungeon")checkStairsDescend();
+      }
+    }
+  }
+}
+function handlePlayerInput(){
+  const p=DUNGEON.player;
+  const D=DUNGEON;
+  let mx=0,my=0;
+  if(key("KeyA","ArrowLeft"))mx-=1;
+  if(key("KeyD","ArrowRight"))mx+=1;
+  if(key("KeyW","ArrowUp"))my-=1;
+  if(key("KeyS","ArrowDown"))my+=1;
+  // 溜め中の武器: Z(発射)以外の行動でキャンセル(古代の装甲なら移動でも維持)
+  const cancelCharge=function(){
+    if(p.charging&&!dStats().chargeMove){
+      p.charging=false;
+      UI.toast("溜めが切れた");
+    }
+  };
+  // フェーズ待ち中に押した移動を即実行(1回だけ消費。押したままなら毎フレームのキー走査が引継ぐ)
+  if(TURN.bufferedDir>=0){
+    cancelCharge();
+    const di=TURN.bufferedDir;
+    TURN.bufferedDir=-1;
+    p.dirIdx=di;
+    tryMovePlayer(di);
+    return;
+  }
+  if(mx||my){
+    cancelCharge();
+    const di=dirIndex(mx,my);
+    p.dirIdx=di;
+    tryMovePlayer(di);
+    return;
+  }
+  if(keyP("KeyZ","KeyJ")){attackAction();return;}
+  if(keyP("KeyX","KeyK")){if(p.charging){p.charging=false;UI.toast("溜めが切れた");}useSkill(0);return;}
+  if(keyP("KeyC","KeyL")){if(p.charging){p.charging=false;UI.toast("溜めが切れた");}useSkill(1);return;}
+  if(keyP("KeyV")){if(p.charging){p.charging=false;UI.toast("溜めが切れた");}useSkill(2);return;}
+  if(keyP("Digit1")){if(p.charging){p.charging=false;UI.toast("溜めが切れた");}if(quickUse("p_hp_s"))endPlayerTurn();return;}
+  if(keyP("Digit2")){if(p.charging){p.charging=false;UI.toast("溜めが切れた");}if(quickUse("p_hp_l"))endPlayerTurn();return;}
+  if(keyP("Digit3")){if(p.charging){p.charging=false;UI.toast("溜めが切れた");}if(quickUse("p_mp"))endPlayerTurn();return;}
+  if(keyP("Space")){if(p.charging){p.charging=false;UI.toast("溜めが切れた");}endPlayerTurn(true,true); /* (T48) isWait=上り階段判定 */}
+}
+function dirIndex(mx,my){
+  for(let i=0;i<8;i++){
+    if(DIRS[i][0]===Math.sign(mx)&&DIRS[i][1]===Math.sign(my))return i;
+  }
+  return mx>0?0:mx<0?4:my>0?2:6;
+}
+function tryMovePlayer(di){
+  const p=DUNGEON.player;
+  const D=DUNGEON;
+  const v=DIRS[di];
+  let nx=p.tx+v[0],ny=p.ty+v[1];
+  const diag=v[0]!==0&&v[1]!==0;
+  if(diag&&!(pWalk(p.tx+v[0],p.ty)&&pWalk(p.tx,p.ty+v[1]))){
+    // コーナーカット不可 → 直交方向に逸らす
+    if(pWalk(nx,p.ty)&&!enemyAt(nx,p.ty))ny=p.ty;
+    else if(pWalk(p.tx,ny)&&!enemyAt(p.tx,ny))nx=p.tx;
+    else {p.dirIdx=di;playBumpSFX();return;} // (T50) 両直交が壁/敵=完全ブロック→ぶつかった音
+  }
+  // 隠し部屋の壁を踏み込む(トルネコの宝箱室)
+  if(MAP.secretWall&&!D.secretOpen&&nx===MAP.secretWall.x&&ny===MAP.secretWall.y&&MAP.grid[ny][nx]===WALL){
+    openSecretRoom();
+    p.dirIdx=di;
+    return; // そのターンは崩すことに使う(1ターン)
+  }
+  const e=enemyAt(nx,ny);
+  if(!pWalk(nx,ny)){p.dirIdx=di;playBumpSFX();return;} // (T50) 壁に衝突→ぶつかった音(向き変更のみ・ターン消費なし)
+  if(e){p.dirIdx=di;playBumpSFX();return;} // (T50) 敵に衝突→同上
+  p.tx=nx;p.ty=ny;
+  p.dirIdx=di;
+  p.moving=true;
+  // (T38) 足音2種を交互に
+  D.stepFlip=(D.stepFlip||0)^1;
+  playSFX(D.stepFlip?"sfx_step2.ogg":"sfx_step1.ogg",0.9);
+  // トラップ部屋のスイッチ
+  if(MAP.trapSwitch&&!D.trapDoorLocked&&p.tx===MAP.trapSwitch.x&&p.ty===MAP.trapSwitch.y){
+    lockTrapRoom();
+  }
+  // 無双乱舞: 1行動で2マス
+  if(p.dashBonusT>0){
+    const nx2=p.tx+v[0],ny2=p.ty+v[1];
+    if(pWalk(nx2,ny2)&&!enemyAt(nx2,ny2)&&!(DUNGEON.player.tx===nx2&&DUNGEON.player.ty===ny2)){
+      p.tx=nx2;p.ty=ny2;
+    }
+  }
+  collectDrops(p);
+  // ハザード/トラップ(踏んだターンに発火)
+  const hz=stepOnHazard();
+  if(hz===2)return; // 転移で新しい階へ(ターンは新しい階でリセット)
+  if(hz===1){endPlayerTurn();return;} // 尖刺/穴: ターン消費
+  // トラップ部屋から出た場合(転移等)も開錠チェック
+  if(MAP.trapSwitch&&D.trapDoorLocked)checkTrapRoomUnlock();
+  // (T48) 上り階段(=入口/spawn)に移動しても何もしない(=待機)。上りは待機/決定操作のみ
+  // (T49) 降り階段(=exit)に踏んだら即降下しない。ターンを終えて敵フェーズ後、
+  //        checkStairsDescend が「降りる/留まる」の選択肢を提示する(降りるは選択のみ)
+  if(p.tx===MAP.exit.x&&p.ty===MAP.exit.y){
+    if(DUNGEON.floor>=100){
+      if(DUNGEON.bossDead){doClear();return;}
+      UI.toast("先に魔王を倒せ!");
+      endPlayerTurn();
+      return;
+    }
+    endPlayerTurn();
+    return;
+  }
+  // 宝箱(1ターン) — 通常/罠箱/ミミック
+  for(const c of DUNGEON.chests){
+    if(!c.open&&c.tx===p.tx&&c.ty===p.ty){
+      c.open=true;
+      if(c.type==="mimic"){
+        // 宝箱の正体はミミック! 隣に出現(隣が埋まっていれば足元)
+        let sx=p.tx,sy=p.ty;
+        const around=[[1,0],[-1,0],[0,1],[0,-1]];
+        for(const d of around){
+          const nx=p.tx+d[0],ny=p.ty+d[1];
+          if(isFloor(nx,ny)&&!enemyAt(nx,ny)){sx=nx;sy=ny;break;}
+        }
+        const m=spawnEnemy("mimic",sx,sy,DUNGEON.floor);
+        DUNGEON.enemies.push(m);
+        UI.toast("宝箱が開いた——ミミックだ!!");
+        playSFX("sfx_boss.ogg",1.0);
+        DUNGEON.shake=8;
+        for(let i=0;i<10;i++)P(c.tx*TILE+16,c.ty*TILE+16,(Math.random()-0.5)*4,-Math.random()*3,0.6,"#a8763e",3);
+        endPlayerTurn();
+        return;
+      }
+      if(c.type==="trap"){
+        // 罠箱: 開くとダメージ+小判が散る
+        damagePlayer(8+DUNGEON.floor);
+        UI.toast("罠箱だった! 小判が散らばった…");
+        playSFX("sfx_ehit.ogg",1.0);
+        DUNGEON.shake=6;
+        tileFlash(c.tx,c.ty,"rgba(255,210,80,");
+        DUNGEON.drops.push({tx:c.tx,ty:c.ty,x:(c.tx+0.5)*TILE,y:(c.ty+0.5)*TILE,id:"gold",n:1,amount:20+Math.floor(Math.random()*30),bob:0,got:false});
+        endPlayerTurn();
+        return;
+      }
+      playSFX("sfx_pickup.ogg",0.9);
+      const it=ALL_ITEMS[c.item.id];
+      UI.toast("宝箱: "+it.name+" を獲得!");
+      addItemEquip(c.item);
+      storeSave();
+      endPlayerTurn();
+      return;
+    }
+  }
+  freeTileInteract();
+  endPlayerTurn();
+}
+function freeTileInteract(){
+  const p=DUNGEON.player;
+  if(MAP.savept&&p.tx===MAP.savept.x&&p.ty===MAP.savept.y){
+    storeSave();
+    playSFX("sfx_stairs.ogg");
+    UI.toast("セーブした。この階から再挑戦できる");
+  }
+  if(MAP.gate&&p.tx===MAP.gate.x&&p.ty===MAP.gate.y&&!UI.gate&&!DUNGEON._gateDone){
+    // (T54) ゲートはこの階の中ボスが守っている。未討伐では使用できない(階段封鎖と同様)
+    if(!(SAVE.miniBossDefeated&&SAVE.miniBossDefeated[DUNGEON.floor])){
+      const mb=DUNGEON.enemies.filter(function(e){return e.mini&&!e.dead;})[0];
+      UI.toast((mb?mb.name:"中ボス")+" がワープゲートを塞いでいる…! 先に倒して。");
+      playBumpSFX();
+    }else{
+      DUNGEON._gateDone=true;
+      G.gateOpen=true;
+      openGateMenu(false,true); // 解放済みダンジョンゲート=地上(町)への選択肢付き
+    }
+  }
+}
+
+// ============================================================
+// 敵AI (ターン制: 敵フェーズでのみ1体ずつ行動)
+// ============================================================
+function enemyAct(e){
+  const p=DUNGEON.player;
+  if(e.dead)return;
+  if(e.freezeT>0){e.freezeT--;UI.float(e.x,e.y-e.r-6,"凍結","#bfe8ff",12);return;}
+  const dist=chebyshev(e,p);
+  // 方向インデックス(プレイヤーの方)
+  e.dirIdx=dirTo(e.tx,e.ty,p.tx,p.ty);
+  // (T41) 中ボス: idle=移動・攻撃しない(隣接Zで会話→戦闘)
+  if(e.mini){
+    if(e.mbState==="idle")return;
+    mbStageCheck(e);
+    bossAct(e,dist);
+    return;
+  }
+  if(e.kind==="boss"){bossAct(e,dist);return;}
+  if(e.chargeWarn){
+    // 突進実行
+    executeCharge(e);
+    return;
+  }
+  if(e.kind==="chase"){
+    if(dist<=1){meleeEnemy(e,1);return;}
+    stepToward(e,p.tx,p.ty,false);
+  }else if(e.kind==="flying"){
+    if(dist<=1){meleeEnemy(e,1.1);return;}
+    if(dist<=3){
+      // 距離を保つ
+      if(Math.random()<0.4)stepToward(e,p.tx-1,p.ty-1,true);
+    }else stepToward(e,p.tx,p.ty,true);
+  }else if(e.kind==="shoot"){
+    e.fireCd--;
+    if(e.fireCd<=0&&dist<=7&&dist>=2&&hasLOS(e.tx,e.ty,p.tx,p.ty)){
+      e.fireCd=3;
+      const v=DIRS[e.dirIdx];
+      DUNGEON.ebullets.push({tx:e.tx+v[0],ty:e.ty+v[1],x:(e.tx+v[0]+0.5)*TILE,y:(e.ty+v[1]+0.5)*TILE,
+        dx:v[0],dy:v[1],dmg:e.atk,col:e.col});
+      playSFX("sfx_skill.ogg",1.3);
+      return;
+    }
+    if(dist<3)stepToward(e,p.tx-1,p.ty-1,false);
+    else if(dist>6)stepToward(e,p.tx,p.ty,false);
+    else if(Math.random()<0.5)stepToward(e,p.tx,p.ty,false);
+  }else if(e.kind==="charge"){
+    if(dist<=1){meleeEnemy(e,1);return;}
+    if(dist<=6&&Math.random()<0.45){
+      // 突進予告
+      const v=DIRS[e.dirIdx];
+      const path=[];
+      for(let k=1;k<=4;k++){
+        const nx=e.tx+v[0]*k,ny=e.ty+v[1]*k;
+        // (T34) 突進も穴を踏みうる(着地マスで発火)
+        if(!isFloor(nx,ny)&&!(nx>=0&&ny>=0&&nx<MW&&ny<MH&&MAP.grid[ny][nx]===PIT))break;
+        path.push({x:nx,y:ny});
+        if(nx===p.tx&&ny===p.ty)break;
+      }
+      if(path.length){
+        e.chargeWarn={dx:v[0],dy:v[1],path:path};
+        DUNGEON.warnings.push({e:e,tx:e.tx,ty:e.ty,path:path,col:"#ff9a2e"});
+        playSFX("sfx_boss.ogg",1.1);
+        return;
+      }
+    }
+    stepToward(e,p.tx,p.ty,false);
+  }
+}
+function dirTo(x0,y0,x1,y1){
+  const dx=x1-x0,dy=y1-y0;
+  let best=0,bd=1e9;
+  for(let i=0;i<8;i++){
+    const d=Math.abs(DIRS[i][0]-dx)+Math.abs(DIRS[i][1]-dy);
+    if(d<bd){bd=d;best=i;}
+  }
+  return best;
+}
+function stepToward(e,tx,ty,allowDiagCorner){
+  const cands=[0,1,2,3,4,5,6,7];
+  // 近い方向から
+  cands.sort(function(a,b){
+    const da=Math.abs(DIRS[a][0]-(tx-e.tx))+Math.abs(DIRS[a][1]-(ty-e.ty));
+    const db=Math.abs(DIRS[b][0]-(tx-e.tx))+Math.abs(DIRS[b][1]-(ty-e.ty));
+    return da-db;
+  });
+  for(const di of cands){
+    const v=DIRS[di];
+    const nx=e.tx+v[0],ny=e.ty+v[1];
+    if(nx===e.tx&&ny===e.ty)continue;
+    // (T34) 敵も穴を踏める(踏んだタイルは埋まる・ダメージ)
+    if(!isFloor(nx,ny)&&!(nx>=0&&ny>=0&&nx<MW&&ny<MH&&MAP.grid[ny][nx]===PIT))continue;
+    if(DUNGEON.player.tx===nx&&DUNGEON.player.ty===ny)continue;
+    // (T41) 中ボスは階段マスに乗り出さない(階段を守るため)
+    if(e.mini&&MAP.exit&&nx===MAP.exit.x&&ny===MAP.exit.y)continue;
+    if(enemyAt(nx,ny))continue;
+    const diag=v[0]!==0&&v[1]!==0;
+    if(diag&&!e.flying&&!canDiag(e.tx+v[0],e.ty,e.tx,e.ty+v[1]))continue;
+    e.tx=nx;e.ty=ny;
+    e.dirIdx=di;
+    enemyStepHazard(e); // (T34) 尖刺/穴/転移も敵が踏む
+    return;
+  }
+}
+function hasLOS(x0,y0,x1,y1){
+  let x=x0,y=y0;
+  while(x!==x1||y!==y1){
+    let sx=Math.sign(x1-x),sy=Math.sign(y1-y);
+    // 対角はどちらか先に進み、壁チェック
+    if(sx!==0&&sy!==0){
+      if(!isFloor(x+sx,y)||!isFloor(x,y+sy))return false;
+    }else if(sx!==0){
+      if(!isFloor(x+sx,y))return false;
+    }else{
+      if(!isFloor(x,y+sy))return false;
+    }
+    x+=sx;y+=sy;
+  }
+  return true;
+}
+function meleeEnemy(e,mult){
+  damagePlayer(e.atk*mult);
+  spawnHitFX(DUNGEON.player.x,DUNGEON.player.y);
+}
+function executeCharge(e){
+  const p=DUNGEON.player;
+  const w=e.chargeWarn;
+  e.chargeWarn=null;
+  DUNGEON.warnings=DUNGEON.warnings.filter(function(q){return q.e!==e;});
+  let hit=false;
+  for(const c of w.path){
+    if(!isFloor(c.x,c.y)&&MAP.grid[c.y][c.x]!==PIT)break;
+    if(enemyAt(c.x,c.y)&&!(DUNGEON.player.tx===c.x&&DUNGEON.player.ty===c.y))break;
+    if(p.tx===c.x&&p.ty===c.y){hit=true;break;}
+    e.tx=c.x;e.ty=c.y;
+  }
+  enemyStepHazard(e); // (T34) 着地マスの穴/尖刺/転移を発火
+  if(hit){meleeEnemy(e,1.4);DUNGEON.shake=8;}
+  else playSFX("sfx_swing.ogg",0.8);
+}
+// (T41) 中ボスHP段階: 初回<66%・<33%で台詞+ボイス(性別別プール)
+function mbStageCheck(e){
+  const ratio=e.hp/e.hpMax;
+  const g=(e.mb.gender==="m"?"m_":"f_");
+  if(!e.saidMid&&ratio<0.66){
+    e.saidMid=true;
+    const lines=MBV_LINES[g+"mid"];
+    UI.speech={text:lines[Math.floor(Math.random()*lines.length)],speaker:e.name,t:3.2};
+    playVoice("mbv_"+g+"mid.ogg");
+  }
+  if(!e.saidLow&&ratio<0.33){
+    e.saidLow=true;
+    const lines=MBV_LINES[g+"low"];
+    UI.speech={text:lines[Math.floor(Math.random()*lines.length)],speaker:e.name,t:3.2};
+    playVoice("mbv_"+g+"low.ogg");
+  }
+}
+function bossAct(e,dist){
+  const p=DUNGEON.player;
+  const phase=e.hp>e.hpMax*0.5?1:2;
+  e.atkCd=(e.atkCd==null?2:phase===2?e.atkCd-1:e.atkCd-1);
+  if(e.chargeWarn){executeCharge(e);return;}
+  if(dist<=1){meleeEnemy(e,1.2);return;}
+  if(e.atkCd<=0){
+    const pat=Math.random();
+    if(pat<0.45){
+      // 放射8方向弾
+      e.atkCd=phase===2?2:3;
+      for(let a=0;a<8;a++){
+        const v=DIRS[a];
+        const nx=e.tx+v[0],ny=e.ty+v[1];
+        if(isFloor(nx,ny)&&!enemyAt(nx,ny)){
+          DUNGEON.ebullets.push({tx:nx,ty:ny,x:(nx+0.5)*TILE,y:(ny+0.5)*TILE,dx:v[0],dy:v[1],dmg:Math.floor(e.atk*0.7),col:"#ff9a2e"});
+        }
+      }
+      playSFX("sfx_boss.ogg");
+    }else if(pat<0.75){
+      // 突進予告
+      e.atkCd=phase===2?2:3;
+      const v=DIRS[e.dirIdx];
+      const path=[];
+      for(let k=1;k<=5;k++){
+        const nx=e.tx+v[0]*k,ny=e.ty+v[1]*k;
+        if(!isFloor(nx,ny))break;
+        if(e.mini&&MAP.exit&&nx===MAP.exit.x&&ny===MAP.exit.y)break; // (T41) 階段マスは踏まない
+        path.push({x:nx,y:ny});
+        if(nx===p.tx&&ny===p.ty)break;
+      }
+      if(path.length){e.chargeWarn={dx:v[0],dy:v[1],path:path};DUNGEON.warnings.push({e:e,tx:e.tx,ty:e.ty,path:path,col:"#ff5a5a"});playSFX("sfx_boss.ogg",0.8);}
+      else stepToward(e,p.tx,p.ty,false);
+    }else{
+      // 周囲AoE(半径2)
+      e.atkCd=phase===2?3:4;
+      if(chebyshev(e,p)<=2){
+        damagePlayer(Math.floor(e.atk*0.8));
+      }
+      DUNGEON.shake=8;
+      playSFX("sfx_boss.ogg",1.2);
+      spawnHolyFX(e.x,e.y,true);
+    }
+  }else{
+    stepToward(e,p.tx,p.ty,false);
+  }
+}
+function moveEbullets(){
+  const D=DUNGEON,p=D.player;
+  const next=[];
+  for(const b of D.ebullets){
+    const nx=b.tx+b.dx,ny=b.ty+b.dy;
+    if(!isFloor(nx,ny))continue; // 壁で消滅
+    if(p.tx===nx&&p.ty===ny){
+      damagePlayer(b.dmg);
+      continue;
+    }
+    if(p.summon&&p.summon.tx===nx&&p.summon.ty===ny){
+      p.summon.hp-=b.dmg;
+      continue;
+    }
+    if(enemyAt(nx,ny))continue; // 敵に吸収
+    b.tx=nx;b.ty=ny;
+    b.x=(nx+0.5)*TILE;b.y=(ny+0.5)*TILE;
+    next.push(b);
+  }
+  D.ebullets=next;
+}
+function movePbullets(){
+  // プレイヤー弾(敵フェーズで1マス進む。shot=初命中で消滅 / bomb=着弾地点で爆発)
+  const D=DUNGEON;
+  const next=[];
+  for(const b of D.pbullets){
+    const nx=b.tx+b.dx,ny=b.ty+b.dy;
+    if(b.boom){
+      // 爆弾: 目標マスまで飛んで爆発
+      b.dist=(b.dist||0)+1;
+      if(!isFloor(nx,ny)){
+        bombExplosion(b); // 壁で消滅: その場で爆発
+        continue;
+      }
+      b.tx=nx;b.ty=ny;
+      b.x=(nx+0.5)*TILE;b.y=(ny+0.5)*TILE;
+      if(b.dist>=b.maxDist){
+        bombExplosion(b);
+        continue;
+      }
+      next.push(b);
+      continue;
+    }
+    if(!isFloor(nx,ny))continue; // 壁で消滅
+    const e=enemyAt(nx,ny);
+    if(e){
+      // 命中時に武器の属性で実ダメージを確定
+      damageEnemy(e,weaponDmg(b.w,dStats(),e,b.mult||1));
+      continue;
+    }
+    b.tx=nx;b.ty=ny;
+    b.x=(nx+0.5)*TILE;b.y=(ny+0.5)*TILE;
+    next.push(b);
+  }
+  D.pbullets=next;
+}
+// ============================================================
+// 環境ハザード・トラップ・隠し部屋・トラップ部屋 (T19〜T22)
+// ============================================================
+function tileFlash(tx,ty,rgbaPrefix){
+  DUNGEON.floats.push({tx:tx,ty:ty,x:(tx+0.5)*TILE,y:(ty+0.5)*TILE,flash:rgbaPrefix,life:0.5});
+}
+// 踏んだマスのハザード/トラップ発火: 0=なし, 1=ターン消費で終了, 2=転移(新しい階へ)
+function stepOnHazard(){
+  const D=DUNGEON,p=D.player;
+  const t=MAP.grid[p.ty][p.tx];
+  if(t===PIT){
+    if(isFlying()){
+      // 飛翔中: 穴の上を無傷で飛ぶ(埋まらない・ターンも消費しない)
+      return 0;
+    }
+    // 穴: 踏んだタイルは埋まる(一発)。最大HP20%+floorダメージ
+    const a=dStats();
+    let dmg=Math.floor(a.hpMax*0.2)+D.floor;
+    if(a.pitReduction)dmg=Math.floor(dmg*0.5);
+    MAP.grid[p.ty][p.tx]=FLOOR;
+    D.pitScar.push({x:p.tx,y:p.ty});
+    invalidateFloor(); // (T45) 穴→床
+    damagePlayer(dmg);
+    UI.float(p.x,p.y-24,"穴に落ちた!","#c8a060",14);
+    D.shake=8;
+    tileFlash(p.tx,p.ty,"rgba(70,45,20,");
+    playSFX("sfx_ehit.ogg",1.0);
+    return 1;
+  }
+  if(D.traps){
+    for(const tr of D.traps){
+      if(!tr.armed||tr.tx!==p.tx||tr.ty!==p.ty)continue;
+      tr.armed=false;
+      if(tr.kind==="spike"){
+        if(isFlying())continue; // 飛翔中: 尖刺を無効(トラップは発火しないまま)
+        // 尖刺: 一発で残骸化
+        damagePlayer(Math.floor(12+D.floor*1.2));
+        UI.float(p.x,p.y-24,"尖刺トラップ!","#ff8a5a",14);
+        D.shake=6;
+        tileFlash(tr.tx,tr.ty,"rgba(255,110,50,");
+        playSFX("sfx_ehit.ogg",1.0);
+        return 1;
+      }else if(tr.kind==="teleport"){
+        // 転移: 現在階+1〜+5階へ
+        UI.toast("転移の紋が光った…!");
+        D.teleT=0.6;
+        D.shake=6;
+        playSFX("sfx_boss.ogg",0.7);
+        const target=Math.min(100,D.floor+1+Math.floor(Math.random()*5));
+        enterFloor(target,false);
+        checkTrapRoomUnlock();
+        return 2;
+      }
+    }
+  }
+  return 0;
+}
+// (T34) 敵がハザード/トラップを踏んだ: 穴(落下・一発)/尖刺(防御減算・一発)/転移(SAVE.teleQueueで+1..+5階へ伝達・プレイヤー到達時に出現)
+function enemyStepHazard(e){
+  const D=DUNGEON;
+  if(!e||e.dead)return;
+  if(G.screen!=="dungeon")return;
+  // 穴: 敵も落ちる(タイルは埋まる・一発)。最大HP20%+floorダメージ
+  if(MAP.grid[e.ty][e.tx]===PIT){
+    MAP.grid[e.ty][e.tx]=FLOOR;
+    D.pitScar.push({x:e.tx,y:e.ty});
+    invalidateFloor(); // (T45) 穴→床
+    const dmg=Math.floor(e.hpMax*0.2)+D.floor;
+    UI.float(e.x,e.y-e.r-6,"穴に落ちた!","#c8a060",12);
+    tileFlash(e.tx,e.ty,"rgba(70,45,20,");
+    playSFX("sfx_ehit.ogg",0.8);
+    damageEnemy(e,dmg);
+    return;
+  }
+  if(D.traps){
+    for(const tr of D.traps){
+      if(!tr.armed||tr.tx!==e.tx||tr.ty!==e.ty)continue;
+      tr.armed=false;
+      if(tr.kind==="spike"){
+        // 尖刺: 12+floor*1.2(防御減算・一発)
+        const dmg=Math.max(1,Math.floor(12+D.floor*1.2)-e.def);
+        UI.float(e.x,e.y-e.r-6,"尖刺トラップ!","#ff8a5a",12);
+        tileFlash(tr.tx,tr.ty,"rgba(255,110,50,");
+        playSFX("sfx_ehit.ogg",0.8);
+        damageEnemy(e,dmg);
+      }else if(tr.kind==="teleport"){
+        // 転移: 敵は消え、+1..+5階へSAVE.teleQueueで伝達。プレイヤーがその階に到達時に出現
+        const target=Math.min(100,D.floor+1+Math.floor(Math.random()*5));
+        SAVE.teleQueue=SAVE.teleQueue||[];
+        SAVE.teleQueue.push({floor:target,id:e.id});
+        e.dead=true; // 死亡ではなく転移(ドロップ/経験なしで現階から除去)
+        UI.toast(e.name+"は転移の紋に吸い込まれて消えた…");
+        tileFlash(tr.tx,tr.ty,"rgba(170,90,255,");
+        D.teleT=0.6;
+        playSFX("sfx_warp.ogg",0.8);
+        storeSave();
+      }
+      return;
+    }
+  }
+}
+// 毒ガス: ターン消費行動ごとに、そのマスにいるならダメージ
+function stepOnPoison(){
+  const p=DUNGEON.player;
+  if(!p||G.screen!=="dungeon")return;
+  if(isFlying())return; // 飛翔中: 毒ガスに無効
+  if(MAP.grid[p.ty][p.tx]!==POISON)return;
+  const a=dStats();
+  let dmg=Math.floor(2+DUNGEON.floor/3);
+  if(a.poisonReduction){dmg=Math.floor(dmg*(1-a.poisonReduction));spawnGuardFX(p.x,p.y);}
+  damagePlayer(dmg);
+  UI.float(p.x,p.y-24,"毒ガス!","#7ec850",13);
+  for(let i=0;i<4;i++)P(p.x+(Math.random()-0.5)*16,p.y+6,0,-2,0.5,"#7ec850",2);
+}
+// ---- 羽ばたく風 (賢者専用・飛翔スキル・ポーズメニュー(P)から使用: T32) ----
+function useFlightSkill(){
+  const D=DUNGEON,p=D&&D.player;
+  if(!p||G.screen!=="dungeon")return;
+  if(SAVE.job!=="mage"){UI.toast("羽ばたく風は賢者の専用スキル");return;}
+  if(p.flySkillCd>0){UI.toast("羽ばたく風は調整中(あと"+p.flySkillCd+"ターン)");return;}
+  if(p.mp<22){UI.toast("MPが足りない(22必要)");return;}
+  p.mp-=22;SAVE.mp=p.mp;
+  p.flyT=12;p.flySkillCd=16;
+  UI.toast("羽ばたく風! (12ターン: 水面を渡れ・毒/穴無効)");
+  playSFX("sfx_fly.ogg");
+  for(let i=0;i<14;i++)P(p.x+(Math.random()-0.5)*20,p.y+4,(Math.random()-0.5)*2.4,-1-Math.random()*2,0.8,"#bfe8ff",2);
+  UI.float(p.x,p.y-24,"羽ばたく風!","#bfe8ff",15);
+}
+// 隠し部屋: 手がかりの壁を踏み込むと崩れて開く
+function openSecretRoom(){
+  const D=DUNGEON,sw=MAP.secretWall;
+  MAP.grid[sw.y][sw.x]=FLOOR;
+  MAP.grid[sw.oy][sw.ox]=FLOOR;
+  D.secretOpen=true;
+  invalidateFloor(); // (T45) 隠し壁→床
+  D.shake=7;
+  playSFX("sfx_stairs.ogg");
+  UI.toast("壁が崩れた! 隠し部屋を発見した!");
+  tileFlash(sw.x,sw.y,"rgba(255,240,180,");
+  tileFlash(sw.ox,sw.oy,"rgba(255,240,180,");
+  // T31: 保留していた報酬が崩落の直後に出現
+  if(D.secretLoot){
+    for(const l of D.secretLoot.drops)D.drops.push(l);
+    if(D.secretLoot.chest)D.chests.push(D.secretLoot.chest);
+    D.secretLoot=null;
+  }
+  endPlayerTurn();
+}
+// スイッチ式トラップ部屋: 踏むと閉鎖+敵出現
+function lockTrapRoom(){
+  const D=DUNGEON;
+  if(!MAP.trapDoor||D.trapDoorLocked)return;
+  D.trapDoorLocked=true;
+  D.trapDoorAnim=0.3;
+  MAP.grid[MAP.trapDoor.y][MAP.trapDoor.x]=LOCKDOOR;
+  invalidateFloor(); // (T45) 床→閉鎖ドア
+  D.shake=12;
+  playSFX("sfx_boss.ogg",1.1);
+  UI.toast("ドォン!! トラップが発動した!");
+  tileFlash(MAP.trapDoor.x,MAP.trapDoor.y,"rgba(120,80,200,");
+  // 部屋内に5〜8体の敵を出現
+  const r=MAP.trapRoom;
+  const n=5+Math.floor(Math.random()*4);
+  const themeEnemies=D.theme.enemies;
+  let placed=0,tries=0;
+  while(placed<n&&tries<200){
+    tries++;
+    const x=r.x+Math.floor(Math.random()*r.w),y=r.y+Math.floor(Math.random()*r.h);
+    if(!isFloor(x,y))continue;
+    if(enemyAt(x,y))continue;
+    if(D.player.tx===x&&D.player.ty===y)continue;
+    const id=themeEnemies[Math.floor(Math.random()*themeEnemies.length)];
+    const e=spawnEnemy(id,x,y,D.floor);
+    e.trapRoomEnemy=true;
+    D.enemies.push(e);
+    D.trapEnemies++;
+    placed++;
+    P((x+0.5)*TILE,(y+0.5)*TILE,0,0,0.5,"#c04a8a",4);
+  }
+  UI.toast("敵が "+placed+" 体出現した! 全滅するか部屋を出て脱出!");
+}
+// トラップ部屋: 敵全滅 or プレイヤーが部屋外 → ドア開錠
+function checkTrapRoomUnlock(){
+  const D=DUNGEON;
+  if(!MAP.trapDoor||!D.trapDoorLocked)return;
+  const r=MAP.trapRoom;
+  if(!r)return;
+  const alive=D.enemies.some(function(e){return !e.dead&&e.trapRoomEnemy;});
+  const pInRoom=pInsideTrapRoom();
+  if(!alive||!pInRoom){
+    D.trapDoorLocked=false;
+    D.trapDoorAnim=-0.3; // 開くアニメ
+    if(MAP.grid[MAP.trapDoor.y][MAP.trapDoor.x]===LOCKDOOR){
+      MAP.grid[MAP.trapDoor.y][MAP.trapDoor.x]=FLOOR;
+    }
+    invalidateFloor(); // (T45) 閉鎖ドア→床
+    UI.toast("トラップ部屋のドアが開いた!");
+    playSFX("sfx_stairs.ogg",0.9);
+  }
+}
+function pInsideTrapRoom(){
+  const r=MAP.trapRoom,p=DUNGEON.player;
+  if(!r||!p)return false;
+  return p.tx>=r.x&&p.tx<r.x+r.w&&p.ty>=r.y&&p.ty<r.y+r.h;
+}
+
+// ============================================================
+// 召喚獣AI (ターン制: プレイヤーターンごとに自動1アクション)
+// ============================================================
+function summonAct(s){
+  const p=DUNGEON.player;
+  s.animT++;
+  // 距離が離れすぎたら追走(1マス)
+  if(chebyshev(s,p)>2){
+    stepToward(s,p.tx,p.ty,false);
+    return;
+  }
+  let target=null,bd=1e9;
+  for(const e of DUNGEON.enemies){
+    if(e.dead)continue;
+    if(e.mini&&e.mbState==="idle")continue; // (T41) idle中ボスは対象外(まず挑発が必要)
+    const d=chebyshev(s,e);
+    if(s.ai==="stalk"){
+      if(e.hp>e.hpMax*0.5&&d<bd){bd=d;target=e;}
+    }else if(d<bd){bd=d;target=e;}
+  }
+  const atkPower=s.atk*(s.atkBuffT>0?1.5:1);
+  if(target){
+    s.dirIdx=dirTo(s.tx,s.ty,target.tx,target.ty);
+    if(s.ai==="melee"||s.ai==="dash"){
+      if(bd>1){
+        stepToward(s,target.tx,target.ty,false);
+      }else{
+        damageEnemy(target,Math.max(1,Math.floor(atkPower-target.def*0.3)));
+        playSFX("sfx_hit.ogg",1.2);
+      }
+    }else if(s.ai==="shoot"){
+      if(bd<=5&&hasLOS(s.tx,s.ty,target.tx,target.ty)){
+        damageEnemy(target,Math.max(1,Math.floor(atkPower-target.def*0.3)));
+        spawnFireBallFX(target);
+        playSFX("sfx_hit.ogg",1.1);
+      }else stepToward(s,target.tx,target.ty,false);
+    }else if(s.ai==="wall"){
+      if(bd<=1){
+        damageEnemy(target,Math.max(1,Math.floor(atkPower*0.8-target.def*0.3)));
+        spawnGuardFX(s.x,s.y);
+      }
+    }else if(s.ai==="stalk"){
+      if(bd<=1){
+        damageEnemy(target,Math.max(1,Math.floor(atkPower*1.3-target.def*0.3)));
+        playSFX("sfx_hit.ogg",1.1);
+      }else stepToward(s,target.tx,target.ty,false);
+    }
+  }
+  // 被弾(敵弾が自分所在マスに来る場合)
+  for(const b of DUNGEON.ebullets){
+    if(b.tx===s.tx&&b.ty===s.ty){s.hp-=b.dmg;}
+  }
+  if(s.hp<=0){
+    UI.toast(SUMMON_BY[s.id].name+" が倒れた…");
+    p.summon=null;
+    spawnDeathFX(s.x,s.y,SUMMON_BY[s.id].col);
+    return;
+  }
+  // 成長(ターンベース)
+  s.actT++;
+  if(s.actT>=20&&s.stage<10){
+    s.actT=0;
+    s.stage++;
+    SAVE.summons[s.id]=s.stage;
+    s.hpMax=40*SUM_STAGE.hp[s.stage-1];
+    s.hp=s.hpMax;
+    s.atk=8*SUM_STAGE.atk[s.stage-1];
+    UI.toast(SUMMON_BY[s.id].name+" が段階"+s.stage+"に進化した!");
+    spawnSummonFX(s.x,s.y,SUMMON_BY[s.id].col);
+    playSFX("sfx_levelup.ogg",0.9);
+  }
+}
+
+// ============================================================
+// エフェクト
+// ============================================================
+function P(x,y,vx,vy,life,col,r,extra){
+  const pt={x:x,y:y,vx:vx,vy:vy,life:life,col:col,r:r};
+  if(extra)Object.assign(pt,extra);
+  DUNGEON.particles.push(pt);
+}
+function spawnHitFX(x,y){for(let i=0;i<6;i++)P(x,y,(Math.random()-0.5)*4,(Math.random()-0.5)*4,0.3,"#fff",2);}
+function spawnDeathFX(x,y,col){for(let i=0;i<14;i++)P(x,y,(Math.random()-0.5)*6,(Math.random()-0.5)*6-2,0.6,col,3);}
+function spawnArcFX(x,y,dir,big){
+  const n=big?14:8;
+  for(let i=0;i<n;i++){
+    const a=dir+(Math.random()-0.5)*1.6;
+    const sp=(big?5:3.5)*Math.random();
+    P(x+Math.cos(a)*10,y+Math.sin(a)*10,Math.cos(a)*sp,Math.sin(a)*sp,0.25,"#fff2c8",2);
+  }
+}
+function spawnHealFX(x,y){for(let i=0;i<10;i++)P(x+(Math.random()-0.5)*20,y+10,0,-2-Math.random()*2,0.7,"#5aff8a",3);}
+function spawnGuardFX(x,y){for(let i=0;i<8;i++){const a=i/8*Math.PI*2;P(x+Math.cos(a)*20,y+Math.sin(a)*20,0,0,0.4,"#8ae8ff",3);}}
+function spawnHolyFX(x,y,big){const n=big?18:10;for(let i=0;i<n;i++){const a=Math.random()*Math.PI*2;const sp=(big?5:3)*Math.random();P(x,y,Math.cos(a)*sp,Math.sin(a)*sp,0.5,"#fff8d0",3);}}
+function spawnIceFX(x,y){for(let i=0;i<14;i++){const a=i/14*Math.PI*2;P(x+Math.cos(a)*30,y+Math.sin(a)*30,-Math.cos(a)*3,-Math.sin(a)*3,0.6,"#bfe8ff",3);}}
+function spawnLightningFX(x,y){P(x,y,0,0,0.3,"#fff",4,{bolt:true});for(let i=0;i<10;i++)P(x+(Math.random()-0.5)*30,y+(Math.random()-0.5)*30,0,-4,0.4,"#cfe8ff",2);}
+function spawnSummonFX(x,y,col){for(let i=0;i<16;i++){const a=i/16*Math.PI*2;P(x+Math.cos(a)*24,y+Math.sin(a)*24,-Math.cos(a)*3,-Math.sin(a)*3,0.6,col,3);}}
+function spawnBerserkFX(x,y){for(let i=0;i<20;i++){const a=Math.random()*Math.PI*2;const sp=6*Math.random();P(x,y,Math.cos(a)*sp,Math.sin(a)*sp,0.5,"#ff5a5a",3);}}
+
+// ============================================================
+// メインアップデート
+// ============================================================
+const G={screen:"title",time:0,paused:false,gateOpen:false,menuSel:0,jobSel:0,help:false,gameoverReason:"",bagOpen:false};
+function update(dt){
+  G.time+=dt;
+  if(G.paused)return;
+  if(G.screen==="dungeon")updateDungeon(dt);
+  else if(G.screen==="town")updateTown(dt);
+  if(DUNGEON){
+    for(const pt of DUNGEON.particles){pt.x+=pt.vx;pt.y+=pt.vy;pt.vy+=0.05;pt.life-=dt;}
+    DUNGEON.particles=DUNGEON.particles.filter(function(p){return p.life>0;});
+    for(const f of DUNGEON.floats){if(!f.flash)f.y-=30*dt;f.life-=dt;}
+    DUNGEON.floats=DUNGEON.floats.filter(function(f){return f.life>0;});
+    if(DUNGEON.shake>0)DUNGEON.shake=Math.max(0,DUNGEON.shake-dt*30);
+    if(DUNGEON.flashT>0)DUNGEON.flashT-=dt;
+    if(DUNGEON.teleT>0)DUNGEON.teleT-=dt;
+    if(DUNGEON.warpT>0)DUNGEON.warpT-=dt; // (T39) スクリーン歪み(無職必殺)
+    if(DUNGEON.trapDoorAnim>0)DUNGEON.trapDoorAnim=Math.max(0,DUNGEON.trapDoorAnim-dt);
+    else if(DUNGEON.trapDoorAnim<0)DUNGEON.trapDoorAnim=Math.min(0,DUNGEON.trapDoorAnim+dt);
+    if(DUNGEON.beams){
+      for(const bm of DUNGEON.beams)bm.life-=dt;
+      DUNGEON.beams=DUNGEON.beams.filter(function(bm){return bm.life>0;});
+    }
+  }
+}
+// マスム中心へピクセル位置を Tween
+function tweenEntities(dt){
+  const D=DUNGEON,k=Math.min(1,dt*20);
+  const p=D.player;
+  if(p){
+    p.x+=((p.tx+0.5)*TILE-p.x)*k;
+    p.y+=((p.ty+0.5)*TILE-p.y)*k;
+    if(p.swing>0)p.swing-=dt;
+    if(p.hitT>0)p.hitT-=dt;
+    p.animT+=dt;
+  }
+  for(const e of D.enemies){
+    e.x+=((e.tx+0.5)*TILE-e.x)*k;
+    e.y+=((e.ty+0.5)*TILE-e.y)*k;
+    if(e.hitT>0)e.hitT-=dt;
+    e.animT+=dt;
+  }
+  if(p&&p.summon){
+    const s=p.summon;
+    s.x+=((s.tx+0.5)*TILE-s.x)*k;
+    s.y+=((s.ty+0.5)*TILE-s.y)*k;
+    s.animT+=dt;
+  }
+}
+function updateDungeon(dt){
+  const D=DUNGEON;
+  if(!D||!D.player||G.screen!=="dungeon")return;
+  D.time+=dt;
+  if(TURN.phase==="player"){
+    // プレイヤーターン開始時に召喚獣が行動(敵フェーズ終了直後)
+    if(D._summonPending){
+      D._summonPending=false;
+      if(D.player.summon)summonAct(D.player.summon);
+    }
+  }
+  updateTurn(dt);
+}
+function nextFloor(){
+  const nf=DUNGEON.floor+1;
+  if(nf>100){G.screen="clear";return;}
+  enterFloor(nf,false);
+}
+// (T48) 上り階段(=降りてきた場所/入口マス)=**一階上**へ戻る。街には直通しない(1Fのみ地上へ)。
+// 装備・金・Lv・訪れた階リストは保持。出口階段と違い中ボスに封じられない(撤退OK)
+function goUpstairs(){
+  const f=DUNGEON.floor;
+  if(f<=1){
+    // 1Fは「上」が存在しないので地上(町)へ
+    G.screen="town";
+    G.gateOpen=false;
+    setupTown();
+    playBGM("bgm_town.ogg");
+    playSFX("sfx_stairs.ogg");
+    UI.toast("地上へ戻った。");
+    return;
+  }
+  enterFloor(f-1,false); // fromGate=false→階段SFX再生・新階の入口(spawn=その階の上り階段)に出現
+  placeAtTopOfStairs(); // (T49) その階の降り階段(出口)の隣に到着 → 降りるかどうかは選択できる
+  UI.toast(f+"F → "+(f-1)+"F (上り階段) 降り階段がある");
+}
+// (T49) 上り階段で降りた先は、その階の降り階段(=exit)の**隣接する床マス**に立つ。
+// (「降りた先に降り階段があるはず」の整合: 階段の真上にスポーンすると即座に選択が出るため、
+//  隣で到着→降りるかどうかはプレイヤーが階段を踏んでから判断できる)
+// 候補は固定優先順(決定論): 右→左→下→上。条件: FLOORのみ(穴/水/毒/柱は不可)・生きた敵不在・
+// 宝箱/トラップ/ワープゲート/セーブポイントのマスではない(着地即トリガー防止)。
+// 全滅時のフォールバック: spawn(入口)のまま(出口は幅3以上の部屋の中心なので実質到達不能)
+function placeAtTopOfStairs(){
+  const D=DUNGEON,p=D.player;
+  if(!p)return;
+  const ex=MAP.exit.x,ey=MAP.exit.y;
+  const order=[[1,0],[-1,0],[0,1],[0,-1]];
+  for(const d of order){
+    const x=ex+d[0],y=ey+d[1];
+    if(!isFloor(x,y))continue;
+    if(enemyAt(x,y))continue;
+    if(MAP.gate&&MAP.gate.x===x&&MAP.gate.y===y)continue;
+    if(MAP.savept&&MAP.savept.x===x&&MAP.savept.y===y)continue;
+    if(D.chests&&D.chests.some(function(c){return !c.open&&c.tx===x&&c.ty===y;}))continue;
+    if(D.traps&&D.traps.some(function(tr){return tr.tx===x&&tr.ty===y;}))continue;
+    if(x===p.tx&&y===p.ty)return;
+    p.tx=x;p.ty=y;p.x=(x+0.5)*TILE;p.y=(y+0.5)*TILE;
+    collectDrops(p);
+    return;
+  }
+}
+function townActivate(t){
+  if(!t)return;
+  playSFX("sfx_click.ogg");
+  if(t.type==="shop")UI.openShop(t.id);
+  else if(t.type==="sell")UI.openSell();
+  else if(t.type==="inn")UI.openInn();
+  else if(t.type==="gate")openGateMenu(true);
+  else if(t.type==="down")startDungeon(1);
+}
+// 町の選択: 行(=y)単位で2Dナビ。十字キー/方向キー/マウスをTOWN.selに統一
+function townRows(){
+  const rows=[];
+  for(const s of TOWN.shops){
+    let r=null;
+    for(const rr of rows)if(Math.abs(rr[0].y-s.y)<20){r=rr;break;}
+    if(!r){r=[s];rows.push(r);}
+    else r.push(s);
+  }
+  rows.forEach(function(r){r.sort(function(a,b){return a.x-b.x;});});
+  rows.sort(function(a,b){return a[0].y-b[0].y;});
+  return rows;
+}
+function townNav(dx,dy){
+  const shops=TOWN.shops;
+  if(!shops.length)return;
+  const rows=townRows();
+  let cur=shops[TOWN.sel]||shops[0];
+  let ri=0,ci=0;
+  for(let i=0;i<rows.length;i++){
+    const j=rows[i].indexOf(cur);
+    if(j>=0){ri=i;ci=j;break;}
+  }
+  if(dx!==0){
+    ci=(ci+dx+rows[ri].length)%rows[ri].length;
+    cur=rows[ri][ci];
+  }else if(dy!==0){
+    const ni=Math.max(0,Math.min(rows.length-1,ri+dy));
+    cur=rows[ni][Math.min(ci,rows[ni].length-1)];
+  }
+  TOWN.sel=Math.max(0,shops.indexOf(cur));
+  playSFX("sfx_click.ogg",1.05);
+}
+function updateTown(dt){
+  townPointer();
+  if(keyR("ArrowLeft","KeyA"))townNav(-1,0);
+  else if(keyR("ArrowRight","KeyD"))townNav(1,0);
+  else if(keyR("ArrowUp","KeyW"))townNav(0,-1);
+  else if(keyR("ArrowDown","KeyS"))townNav(0,1);
+  const target=TOWN.hover||TOWN.shops[TOWN.sel];
+  if(keyP("KeyZ","KeyJ","Enter","Space"))townActivate(target);
+  // 薬の素早い使用 (1,2,3)
+  if(keyP("Digit1"))quickUse("p_hp_s");
+  if(keyP("Digit2"))quickUse("p_hp_l");
+  if(keyP("Digit3"))quickUse("p_mp");
+}
+function quickUse(id){
+  // アイテム使用で溜めはキャンセル
+  if(DUNGEON&&DUNGEON.player&&DUNGEON.player.charging){DUNGEON.player.charging=false;UI.toast("溜めが切れた");}
+  const it=SAVE.inv.find(function(i){return i.id===id;});
+  if(!it||it.n<=0){UI.toast("所持していない");return false;}
+  const def=ALL_ITEMS[id];
+  const d=dStats();
+  if(def.hp){
+    if(SAVE.hp>=d.hpMax){UI.toast("HPは満タン");return false;}
+    SAVE.hp=Math.min(d.hpMax,SAVE.hp+def.hp);
+  }
+  if(def.mp){
+    if(SAVE.mp>=d.mpMax){UI.toast("MPは満タン");return false;}
+    SAVE.mp=Math.min(d.mpMax,SAVE.mp+def.mp);
+  }
+  it.n--;
+  if(it.n<=0)SAVE.inv.splice(SAVE.inv.indexOf(it),1);
+  playSFX("sfx_potion.ogg");
+  UI.float(W/2,H/2-40,"+ "+def.name,"#5aff8a",16);
+  return true;
+}
+
+// ============================================================
+// 地上(町)
+// ============================================================
+const TOWN={hover:null,sel:0,shops:[]};
+function setupTown(){
+  TOWN.hover=null;
+  TOWN.sel=0;
+  // (T46) xはWに対する比率(fx)で保持 → 動的W(画面比横拡張)でも全幅に広がる
+  TOWN.shops=[
+    {id:"weapon",type:"shop",name:"武器屋「刃」",fx:130/960,y:175,desc:"武器を販売・即装備"},
+    {id:"armor",type:"shop",name:"防具屋「盾」",fx:340/960,y:175,desc:"防具を販売・即装備"},
+    {id:"ring",type:"shop",name:"指輪屋「環」",fx:550/960,y:175,desc:"指輪を販売・即装備"},
+    {id:"summon",type:"shop",name:"召喚獣舎「獣」",fx:760/960,y:175,desc:"召喚獣の購入・段階強化"},
+    // (T48) 2行目=5店舗: 旧fx(185px間隔×パネル196px)で隣接11px重複+右端33px画面外溢出。
+    // → パネル幅176px+中心を等間隔に(0.1/0.3/0.5/0.7/0.9=96/288/480/672/864@960 → 左右8px・間隔16px)
+    {id:"sell",type:"sell",name:"古物商「宝」",fx:96/960,y:340,desc:"アイテムを売却"},
+    {id:"inn",type:"inn",name:"宿屋「火」",fx:288/960,y:340,desc:"全回復(100G)・セーブ"},
+    {id:"gate",type:"gate",name:"ワープゲート",fx:480/960,y:340,desc:"解放された階と地上を行き来"},
+    {id:"general",type:"shop",name:"雑貨屋「ガラス」",fx:672/960,y:340,desc:"見透かしメガネを販売"},
+    {id:"down",type:"down",name:"ダンジョン入口",fx:864/960,y:340,desc:"1Fから冒険"}
+  ];
+  layoutTown();
+}
+// (T46) ショップx座標をWに比例配置(drawTown冒頭で毎フレーム呼ぶ→画面回転にも追従)
+function layoutTown(){
+  for(const s of TOWN.shops)s.x=s.fx*W;
+}
+let mouse={x:0,y:0,down:false};
+addEventListener("mousemove",function(e){mouse.x=e.clientX;mouse.y=e.clientY;});
+cv.addEventListener("click",function(){if(window.SUPCLICK){window.SUPCLICK=false;return;}mouse.down=true;});
+// 座標(px,py=キャンバス座標)の下の町施設を返す(半径内)
+function townShopAt(px,py){
+  let best=null,bd=52;
+  for(const s of TOWN.shops){
+    const d=Math.hypot(px-s.x,py-s.y);
+    if(d<bd){bd=d;best=s;}
+  }
+  return best;
+}
+function townPointer(){
+  const r=cv.getBoundingClientRect();
+  const mx=(mouse.x-r.left)/r.width*W;
+  const my=(mouse.y-r.top)/r.height*H;
+  TOWN.hover=townShopAt(mx,my);
+  if(TOWN.hover)TOWN.sel=TOWN.shops.indexOf(TOWN.hover); // ホバーで選択も追従
+}
+function startDungeon(f){
+  G.screen="dungeon";
+  G.gateOpen=false;
+  enterFloor(f,false);
+}
+
+// ============================================================
+// UI 状態とオーバーレイ
+// ============================================================
+const UI={
+  gate:null,shop:null,sell:null,stairs:null, // (T49) 降り階段の「降りる/留まる」選択
+  flashLv:0,toastMsg:null,toastT:0,
+  speech:null, // (T41) {text,speaker,t} 中ボスの吹き出し
+  toast:function(msg){this.toastMsg=msg;this.toastT=3;},
+  float:function(x,y,txt,col,size){
+    if(DUNGEON)DUNGEON.floats.push({x:x,y:y,txt:txt,col:col,size:size,life:1});
+    else if(G.screen==="town"){
+      if(!G._townFloats)G._townFloats=[];
+      G._townFloats.push({x:x,y:y,txt:txt,col:col,size:size,life:1});
+    }
+  },
+  togglePause:function(){
+    if(G.screen!=="dungeon"&&G.screen!=="town")return;
+    G.paused=!G.paused;
+    if(G.paused)stopBGM();
+    else if(G.screen==="dungeon"&&DUNGEON)playBGM(DUNGEON.bgm||(DUNGEON.floor===100?"bgm_boss.ogg":"bgm_dungeon.ogg"));
+    else if(G.screen==="town")playBGM("bgm_town.ogg");
+  },
+  openShop:function(id){
+    if(id==="summon"){
+      UI.shop={open:true,mode:"summon",list:SUMMONS,sel:0,title:"召喚獣舎「獣」",
+        label:function(s){
+          const st=SAVE.summons[s.id]||0;
+          const cost=300+st*400;
+          return s.name+"  "+s.desc+"  段階"+st+"/10  (購入/強化 "+cost+"G)";
+        },
+        buy:function(s){
+          const st=SAVE.summons[s.id]||0;
+          const cost=300+st*400;
+          if(SAVE.gold<cost){UI.toast("金不足("+cost+"G必要)");return;}
+          if(st>=10){UI.toast("最大段階です");return;}
+          SAVE.summons[s.id]=st+1;
+          SAVE.gold-=cost;
+          storeSave();
+          playSFX("sfx_summon.ogg");
+          UI.toast(s.name+" が段階"+(st+1)+"に!");
+        }};
+      return;
+    }
+    if(id==="general"){
+      // 雑貨屋「ガラス」: 見透かしメガネ (T31)
+      UI.shop={open:true,mode:"general",list:[
+        {id:"eye_glasses",name:"見透かしメガネ",price:500,desc:"各階の隠し部屋の壁が見える(金光+?)。一度買えば効果は死亡しても保持"}
+      ],sel:0,title:"雑貨屋「ガラス」",
+        label:function(it){return it.name+"  ("+it.price+"G)  ▸ "+it.desc+(SAVE.eyeOpen?"  [獲得済]":"");},
+        buy:function(it){
+          if(SAVE.eyeOpen){UI.toast("見透かしメガネの効果はすでに獲得済");return;}
+          if(SAVE.gold<it.price){UI.toast("金不足");return;}
+          SAVE.gold-=it.price;
+          SAVE.eyeOpen=true;
+          storeSave();
+          playSFX("sfx_shop.ogg");
+          UI.toast("見透かしメガネ: 隠し部屋の壁が見えるようになった!(金光)");
+        }};
+      return;
+    }
+    let list,title;
+    const maxF=SAVE?SAVE.maxFloor:1;
+    if(id==="weapon"){list=WEAPONS.filter(function(it){return !it.noShop&&(!it.minFloor||maxF>=it.minFloor);});title="武器屋「刃」";}
+    else if(id==="armor"){list=ARMORS.filter(function(it){return !it.minFloor||maxF>=it.minFloor;});title="防具屋「盾」";}
+    else{list=RINGS;title="指輪屋「環」";}
+    UI.shop={open:true,mode:id,list:list,sel:0,title:title,
+      label:function(item){
+        let s=item.name;
+        if(item.atk)s+="  攻+"+item.atk;
+        if(item.mag)s+="  魔+"+item.mag;
+        if(item.def)s+="  守+"+item.def;
+        if(item.spd)s+="  速+"+item.spd;
+        s+="  ("+item.price+"G)";
+        if(item.desc)s+="  ▸ "+item.desc;
+        return s;
+      },
+      buy:function(item){
+        if(SAVE.gold<item.price){UI.toast("金不足");return;}
+        SAVE.gold-=item.price;
+        addItemEquip({kind:UI.shop.mode,id:item.id});
+        storeSave();
+        playSFX("sfx_shop.ogg");
+        // (T38) 装備入手時のtier別入手音
+        const _tier=item.tier?Math.min(6,item.tier):1;
+        playSFX("sfx_pick_t"+_tier+".ogg",1.05);
+        UI.toast(item.name+" を購入・装備");
+      }};
+  },
+  openSell:function(){
+    UI.sell={open:true,sel:0};
+  },
+  sellItem:function(idx){
+    const it=SAVE.inv[idx];
+    if(!it)return;
+    const def=ALL_ITEMS[it.id];
+    if(!def){UI.toast("売れない");return;}
+    const price=Math.max(1,Math.floor((def.price||30)*0.5*it.n));
+    SAVE.gold+=price;
+    it.n--;
+    if(it.n<=0)SAVE.inv.splice(idx,1);
+    if(UI.sell.sel>=SAVE.inv.length)UI.sell.sel=Math.max(0,SAVE.inv.length-1);
+    storeSave();
+    playSFX("sfx_shop.ogg");
+    UI.toast(def.name+" を "+price+"G で売却");
+  },
+  openInn:function(){
+    if(SAVE.gold<100){UI.toast("金不足(100G必要)");return;}
+    SAVE.gold-=100;
+    const d=dStats();
+    SAVE.hp=d.hpMax;SAVE.mp=d.mpMax;
+    storeSave();
+    playSFX("sfx_potion.ogg");
+    playVoice("voice_shop.ogg");
+    UI.toast("ぐっすり眠った。全回復&セーブ");
+  }
+};
+function openGateMenu(fromTown,withTown){
+  // (T54) 移動先=解放済みゲート階(中ボス討伐済みの10F帯)のみ。「訪れた全階」は廃止
+  const list=gateFloors();
+  UI.gate={open:true,fromTown:!!fromTown,town:!!withTown,list:list,sel:0};
+  playSFX("sfx_warp.ogg");
+}
+function gateSelect(){
+  const g=UI.gate;
+  if(g.sel===-1){
+    // (T41) 地上(町)へ戻る
+    g.open=false;
+    G.gateOpen=false;
+    G.screen="town";
+    setupTown();
+    playBGM("bgm_town.ogg");
+    UI.toast("地上へ戻った。");
+    return;
+  }
+  if(!g.list.length)return;
+  const f=g.list[g.sel];
+  g.open=false;
+  G.gateOpen=false;
+  startDungeon(f);
+}
+// (T49) 降り階段(=exit)の選択肢: 降りる / 留まる
+// 表示タイミング: 降り階段に踏んだ→ターン消費→敵フェーズ後(checkStairsDescend)。
+// 表示中は updateTurn が停止(=待機扱い)。「留まる」=階段上に留まったまま通常ターンへ。
+function openStairsChoice(){
+  if(UI.stairs)return; // 二重表示防止
+  UI.stairs={open:true,sel:0,from:DUNGEON.floor};
+  playSFX("sfx_stairs.ogg",0.8);
+}
+// (T55) 階数ラベル: (from+1)を先に計算して結合する。
+// 旧バグ: "降りる (" + s.from + 1 + "F)" の左から結合が文字列化 → 1Fで「11F」/4Fで「41F」/10Fで「101F」
+function stairsDescendText(from){return "降りる ("+(from+1)+"F)";}
+function stairsSubText(from){return (from+1)+"F へ下りる / この階に留まる";}
+function stairsChoose(){
+  const s=UI.stairs;
+  if(!s)return;
+  UI.stairs=null;
+  playSFX("sfx_click.ogg");
+  if(s.sel===0){
+    nextFloor(); // 降りる(100Fはここでclearへ)
+  }else{
+    // 留まる: 階段上に留まったまま。次は移動/待機が自由(待機で再びこの選択が出る)
+    UI.toast("留まる。降り階段は隣に待っている");
+  }
+}
+function shopNav(dir){
+  if(UI.shop&&UI.shop.list.length){
+    UI.shop.sel=(UI.shop.sel+dir+UI.shop.list.length)%UI.shop.list.length;
+  }
+  if(UI.sell&&SAVE.inv.length){
+    UI.sell.sel=(UI.sell.sel+dir+SAVE.inv.length)%SAVE.inv.length;
+  }
+}
+function shopBuy(){
+  if(UI.shop&&UI.shop.list[UI.shop.sel])UI.shop.buy(UI.shop.list[UI.shop.sel]);
+  if(UI.sell)UI.sellItem(UI.sell.sel);
+}
+function closeOverlay(){
+  if(UI.shop){UI.shop=null;playSFX("sfx_click.ogg");}
+  if(UI.sell){UI.sell=null;playSFX("sfx_click.ogg");}
+  if(UI.gate){UI.gate=null;G.gateOpen=false;playSFX("sfx_click.ogg");}
+  // (T49) 階段選択のX/Esc=「留まる」(降下しない)
+  if(UI.stairs){UI.stairs=null;playSFX("sfx_click.ogg");UI.toast("留まる。降り階段は隣に待っている");}
+}
+// 装備・アイテム整理 (Tab/I) — ターン消費しない
+function toggleBag(){
+  if(UI.bag){closeBag();return;}
+  UI.bag={open:true,sel:0};
+  playSFX("sfx_click.ogg");
+}
+function closeBag(){
+  UI.bag=null;
+  playSFX("sfx_click.ogg");
+}
+function bagNav(dir){
+  if(!UI.bag)return;
+  const n=SAVE.inv.length;
+  if(!n)return;
+  UI.bag.sel=(UI.bag.sel+dir+n)%n;
+  playSFX("sfx_click.ogg",1.1);
+}
+function bagConfirm(){
+  if(!UI.bag)return;
+  const it=SAVE.inv[UI.bag.sel];
+  if(!it)return;
+  const def=ALL_ITEMS[it.id];
+  if(itemSlotOf(def)){
+    equipFromBag(UI.bag.sel);
+    storeSave();
+    playSFX("sfx_shop.ogg");
+  }else{
+    if(quickUse(it.id))storeSave();
+  }
+  if(UI.bag.sel>=SAVE.inv.length)UI.bag.sel=Math.max(0,SAVE.inv.length-1);
+}
+function bagSell(){
+  if(!UI.bag)return;
+  const it=SAVE.inv[UI.bag.sel];
+  if(!it)return;
+  const def=ALL_ITEMS[it.id];
+  const price=Math.max(1,Math.floor((def.price||30)*0.5*it.n));
+  SAVE.gold+=price;
+  it.n--;
+  if(it.n<=0)SAVE.inv.splice(UI.bag.sel,1);
+  if(UI.bag.sel>=SAVE.inv.length)UI.bag.sel=Math.max(0,SAVE.inv.length-1);
+  storeSave();
+  playSFX("sfx_shop.ogg");
+  UI.toast(def.name+" を "+price+"G で売却");
+}
+function bagInput(){
+  if(!UI.bag)return;
+  if(keyR("ArrowUp","KeyW"))bagNav(-1);
+  if(keyR("ArrowDown","KeyS"))bagNav(1);
+  if(keyP("KeyZ","KeyJ","Enter"))bagConfirm();
+  if(keyP("KeyX","KeyL"))bagSell();
+  if(keyP("Escape","Tab","KeyI"))closeBag();
+}
+// タイトル
+function titleNav(dir){G.menuSel=(G.menuSel+dir+3)%3;}
+function titleConfirm(){
+  playSFX("sfx_click.ogg");
+  if(G.menuSel===0){
+    G.screen="job";
+    G.jobSel=0;
+  }else if(G.menuSel===1){
+    if(SAVE){
+      G.screen="town";
+      setupTown();
+      playBGM("bgm_town.ogg");
+      UI.toast("ようこそ、"+JOBS[SAVE.job].name+"。準備はいいか?");
+    }else UI.toast("セーブデータなし");
+  }else{
+    G.help=true;
+  }
+}
+function jobNav(dir){
+  const n=Object.keys(JOBS).length;
+  G.jobSel=(G.jobSel+dir+n)%n;
+  playSFX("sfx_click.ogg",1.2);
+}
+function jobConfirm(){
+  playSFX("sfx_click.ogg");
+  startRun(Object.keys(JOBS)[G.jobSel]);
+}
+function startRun(jobId){
+  SAVE=newSave(jobId);
+  storeSave();
+  G.screen="town";
+  setupTown();
+  playBGM("bgm_town.ogg");
+  UI.toast("準備はいいか? ダンジョン入口から降りろ");
+}
+
+// ============================================================
+// 描画
+// ============================================================
+function img(name,x,y,w,h,fb){
+  const im=IMG[name];
+  if(im&&im._ok)ctx.drawImage(im,x,y,w,h);
+  else if(fb){
+    ctx.fillStyle=fb;
+    ctx.beginPath();ctx.arc(x+w/2,y+h/2,Math.min(w,h)/2.4,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle="rgba(0,0,0,.4)";ctx.stroke();
+  }
+}
+// (T46) 全面背景: アスペクト比保持+cover(中央クロップ)で描画 — 動的W(横拡張)による引き伸ばし歪みを防止
+function imgCover(name,x,y,w,h,fb){
+  const im=IMG[name];
+  if(im&&im._ok){
+    const iw=im.naturalWidth||im.width,ih=im.naturalHeight||im.height;
+    if(iw&&ih){
+      const sc=Math.max(w/iw,h/ih);
+      ctx.drawImage(im,x+(w-iw*sc)/2,y+(h-ih*sc)/2,iw*sc,ih*sc);
+      return;
+    }
+  }
+  if(fb){ctx.fillStyle=fb;ctx.fillRect(x,y,w,h);}
+}
+function panel(x,y,w,h,hi){
+  ctx.fillStyle=hi?"rgba(70,52,24,.93)":"rgba(28,25,20,.88)";
+  ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle=hi?"#ffd24a":"#6a5a30";
+  ctx.lineWidth=hi?2:1;
+  ctx.strokeRect(x+2,y+2,w-4,h-4);
+  ctx.fillStyle=hi?"#ffd24a":"#6a5a30";
+  ctx.fillRect(x,y,8,2);ctx.fillRect(x,y,2,8);
+  ctx.fillRect(x+w-8,y,8,2);ctx.fillRect(x+w-2,y,2,8);
+  ctx.fillRect(x,y+h-2,8,2);ctx.fillRect(x,y+h-8,2,8);
+  ctx.fillRect(x+w-8,y+h-2,8,2);ctx.fillRect(x+w-2,y+h-8,2,8);
+}
+function wrapText(txt,x,y,mw,lh){
+  let line="",yy=y;
+  for(const ch of txt){
+    if(ctx.measureText(line+ch).width>mw){ctx.fillText(line,x,yy);line=ch;yy+=lh;}
+    else line+=ch;
+  }
+  if(line)ctx.fillText(line,x,yy);
+}
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  if(G.screen==="title")drawTitle();
+  else if(G.screen==="job")drawJobSelect();
+  else if(G.screen==="town")drawTown();
+  else if(G.screen==="dungeon")drawDungeon();
+  else if(G.screen==="gameover")drawGameOver();
+  else if(G.screen==="clear")drawClear();
+  drawHUD();
+  drawOverlays();
+  drawToast();
+  drawSpeechBubble();
+  if(G.paused)drawPause();
+}
+function drawTitle(){
+  imgCover("bg_title.png",0,0,W,H,"#0a0a14");
+  ctx.fillStyle="rgba(5,5,10,.35)";ctx.fillRect(0,0,W,H);
+  ctx.save();
+  ctx.textAlign="center";
+  ctx.shadowColor="#ffb020";ctx.shadowBlur=24;
+  ctx.fillStyle="#ffd97a";
+  ctx.font="bold 56px serif";
+  ctx.fillText("伝説の唐揚げダンジョン",W/2,140);
+  ctx.shadowBlur=0;
+  ctx.fillStyle="#e8d9a0";ctx.font="16px sans-serif";
+  ctx.fillText("〜 100階の深淵から、黄金の唐揚げを取り戻せ 〜",W/2,178);
+  ctx.restore();
+  ctx.textAlign="center";
+  for(let i=0;i<3;i++){
+    const y=300+i*46;
+    const sel=G.menuSel===i;
+    ctx.fillStyle=sel?"rgba(255,190,60,.95)":"rgba(232,217,160,.8)";
+    ctx.font=(sel?"bold ":"")+"22px sans-serif";
+    ctx.fillText((sel?"▶ ":"")+["新しい冒険","続ける(セーブあり)","操作説明"][i],W/2,y);
+  }
+  ctx.fillStyle="rgba(200,190,150,.55)";ctx.font="13px sans-serif";
+  ctx.fillText("↑↓:選択  Z/Enter:決定   難易度: 高",W/2,462);
+  if(SAVE)ctx.fillText("セーブ: "+JOBS[SAVE.job].name+" Lv."+SAVE.lv+" / 最深 "+SAVE.maxFloor+"F"+(SAVE.cleared?" / クリア済":""),W/2,488);
+  // (T44) モバイル: タップで音が開始されることを案内
+  ctx.fillStyle="rgba(150,140,110,.5)";ctx.font="12px sans-serif";
+  ctx.fillText("モバイル: 画面をタップすると音声が開始されます",W/2,508);
+  // タイトル入力
+  if(keyP("ArrowUp","KeyW"))titleNav(-1);
+  if(keyP("ArrowDown","KeyS"))titleNav(1);
+  if(keyP("KeyZ","Enter"))titleConfirm();
+}
+function drawJobSelect(){
+  imgCover("bg_title.png",0,0,W,H,"#0a0a14");
+  ctx.fillStyle="rgba(5,5,10,.62)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 30px serif";
+  ctx.fillText("主人公のJOBを選べ",W/2,56);
+  const jobs=Object.keys(JOBS);
+  for(let i=0;i<jobs.length;i++){
+    const j=JOBS[jobs[i]];
+    const x=68+i*172,y=92;
+    const sel=G.jobSel===i;
+    panel(x,y,158,340,sel);
+    img(jobs[i]+".png",x+39,y+18,80,80,"#555");
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font="bold 19px sans-serif";
+    ctx.fillText(j.name,x+79,y+128);
+    ctx.fillStyle="rgba(230,220,180,.78)";ctx.font="11px sans-serif";
+    wrapText(j.desc,x+79,y+150,140,15);
+    ctx.fillStyle="rgba(150,150,150,.65)";ctx.font="11px sans-serif";
+    ctx.fillText("HP"+j.base.hp+" 攻"+j.base.atk+" 魔"+j.base.mag,x+79,y+262);
+    ctx.fillText("守"+j.base.def+" 速"+j.base.spd,x+79,y+280);
+    ctx.fillStyle="rgba(120,120,140,.6)";ctx.font="10px sans-serif";
+    wrapText(j.skills.map(function(s){return s.name;}).join(" / "),x+79,y+304,140,13);
+  }
+  ctx.fillStyle="rgba(200,190,150,.7)";ctx.font="14px sans-serif";
+  ctx.fillText("← → で選択  Z/Enter で決定",W/2,478);
+  if(keyP("ArrowLeft","KeyA"))jobNav(-1);
+  if(keyP("ArrowRight","KeyD"))jobNav(1);
+  if(keyP("KeyZ","Enter"))jobConfirm();
+}
+function drawTown(){
+  layoutTown(); // (T46) 動的W(画面回転)に追従
+  imgCover("bg_town.png",0,0,W,H,"#1a1420");
+  ctx.fillStyle="rgba(10,8,14,.25)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 26px serif";
+  ctx.fillText("〜 地上: 旅の始まりの町 〜",W/2,48);
+  ctx.fillStyle="#ffd24a";ctx.font="bold 17px sans-serif";
+  ctx.fillText("所持金: "+SAVE.gold+"G",W/2,76);
+  for(let si=0;si<TOWN.shops.length;si++){
+    const s=TOWN.shops[si];
+    const sel=si===TOWN.sel;
+    // (T48) 2行目(y=340)は5店舗のためパネル176px(1行目=196px)。中央基準で左右に広がる
+    const pw=s.y>250?176:196,px0=s.x-pw/2;
+    panel(px0,s.y-58,pw,112,sel);
+    // 選択中(キー/タッチナビ)の建物にパルスリング
+    if(sel){
+      const pl=0.5+0.5*Math.sin(G.time*4);
+      ctx.strokeStyle="rgba(255,210,74,"+(0.35+0.35*pl)+")";
+      ctx.lineWidth=3;
+      ctx.strokeRect(px0-6,s.y-64,pw+12,124);
+    }
+    const ic=s.type==="shop"?(s.id==="weapon"?"icon_sword.png":s.id==="armor"?"icon_plate.png":s.id==="ring"?"icon_ring_atk.png":"icon_summonmat.png"):(s.type==="sell"?"icon_gold.png":s.type==="inn"?"icon_potion_s.png":s.type==="gate"?"gate.png":"stairs.png");
+    img(ic,px0+12,s.y-40,36,36,"#665");
+    ctx.textAlign="left";
+    // (T48) 2行目はパネルが176pxのためテキスト起点を左へ・店名14pxで幅確保(1行目は従来どおり16px)
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font=(s.y>250?"bold 14px":"bold 16px")+" sans-serif";
+    ctx.fillText(s.name,px0+54,s.y-26);
+    ctx.fillStyle="rgba(220,210,170,.72)";ctx.font="11px sans-serif";
+    ctx.fillText(s.desc,px0+54,s.y-2);
+  }
+  ctx.textAlign="center";
+  ctx.fillStyle="rgba(200,190,150,.6)";ctx.font="13px sans-serif";
+  ctx.fillText("マウス/十字キーで選択  クリック/Zで利用   1/2/3: 薬・エーテル   P: ポーズ",W/2,506);
+  ctx.textAlign="left";ctx.fillStyle="rgba(200,190,150,.6)";ctx.font="12px sans-serif";
+  const we=SAVE.equip.weapon?ALL_ITEMS[SAVE.equip.weapon].name:"なし";
+  const ar=SAVE.equip.armor?ALL_ITEMS[SAVE.equip.armor].name:"なし";
+  const rg=SAVE.equip.ring?ALL_ITEMS[SAVE.equip.ring].name:"なし";
+  ctx.fillText("Lv."+SAVE.lv+"  武器:"+we+"  防具:"+ar+"  指輪:"+rg,18,526);
+  // クリック
+  if(mouse.down)townActivate(TOWN.hover);
+  mouse.down=false;
+  // 町のフロート
+  if(G._townFloats){
+    for(const f of G._townFloats){f.y-=30/60;f.life-=1/60;}
+    G._townFloats=G._townFloats.filter(function(f){return f.life>0;});
+    ctx.textAlign="center";
+    for(const f of G._townFloats){
+      ctx.globalAlpha=Math.min(1,f.life*2);
+      ctx.fillStyle=f.col;ctx.font="bold "+(f.size||14)+"px sans-serif";
+      ctx.fillText(f.txt,f.x,f.y);
+    }
+    ctx.globalAlpha=1;
+  }
+}
+const ZOOM=1.5;
+function dirAngle(di){
+  const v=DIRS[di];
+  return Math.atan2(v[1],v[0]);
+}
+// 見透かしメガネ: 隠し部屋壁の金光+「?」 (T31)
+function drawSecretGlow(px,py,w,h){
+  const a=0.45+0.3*Math.sin(G.time*5);
+  ctx.strokeStyle="rgba(255,215,80,"+a+")";
+  ctx.lineWidth=2;
+  ctx.strokeRect(px+2,py+2,w-4,h-4);
+  ctx.fillStyle="rgba(255,215,80,"+(a*0.18)+")";
+  ctx.fillRect(px+2,py+2,w-4,h-4);
+  ctx.fillStyle="rgba(255,230,140,"+a+")";
+  ctx.font="bold 15px serif";ctx.textAlign="center";
+  ctx.fillText("?",px+w/2,py+h/2+5);
+  ctx.textAlign="left";
+}
+// ---------- (T45) 床レイヤーキャッシュ ----------
+// マップ全体の静的床(床/壁/柱/穴/水base/毒base/2.5D影)をオフスクリーンキャンバスに1回だけ描画。
+// 毎フレームは表示域のdrawImage 1回で代替(従来: 可視タイル約340枚×2〜8操作+createLinearGradient大量確保)。
+// 動的要素(毒泡/水の揺らぎ/穴の痕/隠し壁の光)は毎フレーム重ね描画(drawFloorDynamics)。
+let FLOOR_CV=null,FLOOR_CTX=null,FLOOR_DIRTY=true,FLOOR_DYNAMIC=null;
+function invalidateFloor(){FLOOR_DIRTY=true;}
+function renderFloorCache(){
+  const c=FLOOR_CTX;
+  c.clearRect(0,0,MW*TILE,MH*TILE);
+  const th=DUNGEON?DUNGEON.theme:null;
+  const floorIm=th?IMG[th.floor]:null;
+  const wallIm=IMG["tile_wall.png"];
+  const poisonEdge=[],waterTiles=[];
+  for(let y=0;y<MH;y++){
+    for(let x=0;x<MW;x++){
+      const px=x*TILE,py=y*TILE;
+      const t=MAP.grid[y][x];
+      if(t===FLOOR||t===POISON||t===PIT){
+        // ---- 床系 (T29: 草10%/石10%バリエーション・(x,y)擬似乱数) ----
+        const vv=(((x*73856093)^(y*19349663))>>>0)%100;
+        let tileIm=floorIm;
+        if(t===FLOOR){
+          if(vv<10)tileIm=IMG["tile_grass.png"];
+          else if(vv<20)tileIm=IMG["tile_stone.png"];
+        }
+        if(tileIm&&tileIm._ok)c.drawImage(tileIm,px,py,TILE,TILE);
+        else{
+          c.fillStyle=(x+y)%2?"#4a4436":"#423c30";
+          c.fillRect(px,py,TILE,TILE);
+        }
+        c.fillStyle="rgba(255,240,200,.07)";
+        c.fillRect(px,py,TILE,TILE);
+        if(t===POISON){
+          // 毒ガスbase(ゆらぎの平均αで固定; 縁の泡は動的オーバーレイ)
+          c.fillStyle="rgba(90,200,70,.28)";
+          c.fillRect(px,py,TILE,TILE);
+          const pEdge=(x>0&&MAP.grid[y][x-1]===FLOOR)||(x<MW-1&&MAP.grid[y][x+1]===FLOOR)||
+            (y>0&&MAP.grid[y-1][x]===FLOOR)||(y<MH-1&&MAP.grid[y+1][x]===FLOOR);
+          if(pEdge)poisonEdge.push(x,y);
+        }
+        if(t===PIT){
+          // 穴: 暗い落ち窪み
+          c.fillStyle="rgba(10,6,2,.88)";
+          c.fillRect(px+1,py+1,TILE-2,TILE-2);
+          c.fillStyle="rgba(0,0,0,.9)";
+          c.beginPath();c.ellipse(px+16,py+18,11,9,0,0,Math.PI*2);c.fill();
+          c.fillStyle="rgba(255,220,150,.14)";
+          c.beginPath();c.ellipse(px+16,py+14,11,4,0,0,Math.PI*2);c.fill();
+        }
+        // 2.5D: 上の壁からの影(南隣が壁なら床の上部が暗い)
+        if(y>0&&(MAP.grid[y-1][x]===WALL||MAP.grid[y-1][x]===PILLAR)){
+          const grd=c.createLinearGradient(0,py,0,py+10);
+          grd.addColorStop(0,"rgba(0,0,0,.45)");
+          grd.addColorStop(1,"rgba(0,0,0,0)");
+          c.fillStyle=grd;
+          c.fillRect(px,py,TILE,10);
+        }
+      }else if(t===PILLAR){
+        // ---- 柱: 床+2.5Dブロック ----
+        if(floorIm&&floorIm._ok)c.drawImage(floorIm,px,py,TILE,TILE);
+        else{c.fillStyle=(x+y)%2?"#4a4436":"#423c30";c.fillRect(px,py,TILE,TILE);}
+        // 長影(右下)
+        c.fillStyle="rgba(0,0,0,.3)";
+        c.beginPath();c.ellipse(px+22,py+26,14,7,0,0,Math.PI*2);c.fill();
+        // 柱体
+        c.fillStyle="#6b6558";
+        c.fillRect(px+5,py-4,TILE-10,TILE-4);
+        c.fillStyle="rgba(255,255,255,.18)";
+        c.fillRect(px+5,py-4,TILE-10,4);
+        c.fillStyle="rgba(0,0,0,.3)";
+        c.fillRect(px+5,py+TILE-12,TILE-10,8);
+        // 2.5D: 南隣が床なら前側面
+        if(y+1<MH&&(MAP.grid[y+1][x]===FLOOR||MAP.grid[y+1][x]===POISON||MAP.grid[y+1][x]===PIT)){
+          c.fillStyle="#4a453c";
+          c.fillRect(px+5,py+TILE-8,TILE-10,10);
+          c.fillStyle="rgba(255,255,255,.06)";
+          c.fillRect(px+5,py+TILE-8,TILE-10,2);
+        }
+      }else if(t===LOCKDOOR){
+        // ---- 閉鎖ドア(トラップ部屋) ----
+        if(wallIm&&wallIm._ok)c.drawImage(wallIm,px,py,TILE,TILE);
+        else{c.fillStyle="#17140f";c.fillRect(px,py,TILE,TILE);}
+        c.fillStyle="#5a5248";
+        c.fillRect(px+3,py-4,TILE-6,TILE+4);
+        c.fillStyle="rgba(255,255,255,.12)";
+        c.fillRect(px+3,py-4,TILE-6,3);
+        c.fillStyle="rgba(0,0,0,.4)";
+        c.fillRect(px+3,py+TILE-6,TILE-6,6);
+        // 鉄の帯
+        c.fillStyle="rgba(40,40,46,.85)";
+        c.fillRect(px+3,py+6,TILE-6,4);
+        c.fillRect(px+3,py+TILE-12,TILE-6,4);
+        c.fillStyle="rgba(255,200,120,.25)";
+        c.fillRect(px+TILE/2-2,py+TILE/2-2,4,4);
+      }else if(t===WATER){
+        // ---- 水面 (T29): 水タイル+水際暗化(base; 波のゆらぎは動的オーバーレイ) ----
+        const wIm=IMG["tile_water.png"];
+        if(wIm&&wIm._ok)c.drawImage(wIm,px,py,TILE,TILE);
+        else{c.fillStyle="#1c3a5a";c.fillRect(px,py,TILE,TILE);}
+        c.fillStyle="rgba(4,12,26,.4)";
+        if(x>0&&(MAP.grid[y][x-1]===FLOOR||MAP.grid[y][x-1]===POISON||MAP.grid[y][x-1]===PIT))c.fillRect(px,py,4,TILE);
+        if(x<MW-1&&(MAP.grid[y][x+1]===FLOOR||MAP.grid[y][x+1]===POISON||MAP.grid[y][x+1]===PIT))c.fillRect(px+TILE-4,py,4,TILE);
+        if(y>0&&(MAP.grid[y-1][x]===FLOOR||MAP.grid[y-1][x]===POISON||MAP.grid[y-1][x]===PIT))c.fillRect(px,py,TILE,4);
+        if(y<MH-1&&(MAP.grid[y+1][x]===FLOOR||MAP.grid[y+1][x]===POISON||MAP.grid[y+1][x]===PIT))c.fillRect(px,py+TILE-4,TILE,4);
+        waterTiles.push(x,y);
+      }else{
+        // ---- 壁(2.5D: 南隣が床なら「面」を描画) ----
+        const belowWalk=y+1<MH&&(MAP.grid[y+1][x]===FLOOR||MAP.grid[y+1][x]===POISON||MAP.grid[y+1][x]===PIT||MAP.grid[y+1][x]===WATER);
+        const isSecret=MAP.secretWall&&!(DUNGEON&&DUNGEON.secretOpen)&&MAP.secretWall.x===x&&MAP.secretWall.y===y;
+        if(belowWalk){
+          if(wallIm&&wallIm._ok)c.drawImage(wallIm,px,py-6,TILE,TILE);
+          else{c.fillStyle="#17140f";c.fillRect(px,py-6,TILE,TILE);}
+          c.fillStyle="rgba(0,0,0,.42)";
+          c.fillRect(px,py-6,TILE,TILE-8);
+          c.fillStyle="rgba(255,255,255,.14)";
+          c.fillRect(px,py-6,TILE,3);
+          // 前側面(下の床に8px食い込む立体ブロック)
+          c.fillStyle="rgba(0,0,0,.34)";
+          c.fillRect(px,py+TILE-8,TILE,16);
+          c.fillStyle="rgba(255,255,255,.05)";
+          c.fillRect(px,py+TILE-8,TILE,2);
+          // 右隣が壁なら右端面(角の立体感)
+          if(x+1<MW&&MAP.grid[y][x+1]===WALL){
+            c.fillStyle="rgba(255,255,255,.04)";
+            c.fillRect(px+TILE-4,py-6,4,TILE+8);
+          }
+          if(isSecret){
+            // 隠し部屋の手がかり: 壁面がわずかに明るい(光は動的オーバーレイ)
+            c.fillStyle="rgba(255,240,200,.10)";
+            c.fillRect(px,py-6,TILE,TILE+8);
+          }
+        }else{
+          if(wallIm&&wallIm._ok)c.drawImage(wallIm,px,py,TILE,TILE);
+          else{c.fillStyle="#17140f";c.fillRect(px,py,TILE,TILE);}
+          c.fillStyle="rgba(0,0,0,.42)";
+          c.fillRect(px,py,TILE,TILE);
+          c.fillStyle="rgba(255,255,255,.12)";
+          c.fillRect(px,py,TILE,3);
+          c.fillStyle="rgba(0,0,0,.55)";
+          c.fillRect(px,py+TILE-4,TILE,4);
+          if(isSecret){
+            c.fillStyle="rgba(255,240,200,.10)";
+            c.fillRect(px,py,TILE,TILE);
+          }
+        }
+      }
+    }
+  }
+  FLOOR_DYNAMIC={poisonEdge:poisonEdge,water:waterTiles};
+}
+function ensureFloorCache(){
+  if(!FLOOR_CV){
+    FLOOR_CV=document.createElement("canvas");
+    FLOOR_CV.width=MW*TILE;FLOOR_CV.height=MH*TILE;
+    FLOOR_CTX=FLOOR_CV.getContext("2d");
+    renderFloorCache();
+  }else if(FLOOR_DIRTY){
+    renderFloorCache();
+  }
+  FLOOR_DIRTY=false;
+}
+// (T45) 動的床オーバーレイ: 毒泡/水の揺らぎ/穴の痕/隠し壁の光(表示域のみ)
+function drawFloorDynamics(x0,y0,x1,y1){
+  const D=DUNGEON,dy=FLOOR_DYNAMIC;
+  if(!dy)return;
+  // 毒ガスの泡(縁タイルのみ)
+  if(dy.poisonEdge.length){
+    ctx.fillStyle="rgba(160,255,120,.55)";
+    for(let i=0;i<dy.poisonEdge.length;i+=2){
+      const x=dy.poisonEdge[i],y=dy.poisonEdge[i+1];
+      if(x<x0||x>=x1||y<y0||y>=y1)continue;
+      const px=x*TILE,py=y*TILE;
+      for(let bi=0;bi<3;bi++){
+        const bx=px+6+((bi*11+x*7+y*5)%20),by=py+28-((G.time*14+bi*9+x*3)%26);
+        ctx.beginPath();ctx.arc(bx,by,1.6+bi*0.6,0,Math.PI*2);ctx.fill();
+      }
+    }
+  }
+  // 波のゆらぎ
+  if(dy.water.length){
+    ctx.strokeStyle="rgba(190,225,255,.22)";
+    ctx.lineWidth=1.5;
+    const wt=G.time*0.8;
+    for(let i=0;i<dy.water.length;i+=2){
+      const x=dy.water[i],y=dy.water[i+1];
+      if(x<x0||x>=x1||y<y0||y>=y1)continue;
+      const px=x*TILE,py=y*TILE;
+      for(let wi=0;wi<2;wi++){
+        const wy=py+9+wi*13+Math.sin(wt*2+x*0.9+wi*2.4)*2;
+        const wx=px+((wt*10+wi*16+x*7)%TILE);
+        ctx.beginPath();ctx.moveTo(wx,wy);ctx.lineTo(wx+8,wy);ctx.stroke();
+      }
+    }
+  }
+  // 埋まった穴の痕(踏んだあと)
+  if(D.pitScar&&D.pitScar.length){
+    ctx.fillStyle="rgba(0,0,0,.35)";
+    for(let si=0;si<D.pitScar.length;si++){
+      const s=D.pitScar[si];
+      if(s.x<x0||s.x>=x1||s.y<y0||s.y>=y1)continue;
+      ctx.beginPath();ctx.ellipse(s.x*TILE+16,s.y*TILE+18,10,7,0,0,Math.PI*2);ctx.fill();
+    }
+  }
+  // 隠し壁の光(見透かしメガネ獲得時のみ)
+  if(MAP.secretWall&&!D.secretOpen&&SAVE&&SAVE.eyeOpen){
+    const sx=MAP.secretWall.x,sy=MAP.secretWall.y;
+    if(sx>=x0&&sx<x1&&sy>=y0&&sy<y1){
+      const belowWalk=sy+1<MH&&(MAP.grid[sy+1][sx]===FLOOR||MAP.grid[sy+1][sx]===POISON||MAP.grid[sy+1][sx]===PIT||MAP.grid[sy+1][sx]===WATER);
+      drawSecretGlow(sx*TILE,belowWalk?sy*TILE-6:sy*TILE,TILE,belowWalk?TILE+8:TILE);
+    }
+  }
+}
+function drawDungeon(){
+  const D=DUNGEON;
+  if(!D)return;
+  const P=D.player;
+  const viewW=W/ZOOM,viewH=H/ZOOM;
+  const camX=Math.max(0,Math.min(MW*TILE-viewW,P.x-viewW/2));
+  const camY=Math.max(0,Math.min(MH*TILE-viewH,P.y-viewH/2));
+  ctx.save();
+  const shx=(Math.random()-0.5)*D.shake,shy=(Math.random()-0.5)*D.shake;
+  ctx.translate(-camX*ZOOM+shx,-camY*ZOOM+shy);
+  ctx.scale(ZOOM,ZOOM);
+  const th=D.theme;
+  const x0=Math.floor(camX/TILE),y0=Math.floor(camY/TILE);
+  const x1=Math.min(MW,Math.ceil((camX+viewW)/TILE)+1);
+  const y1=Math.min(MH,Math.ceil((camY+viewH)/TILE)+1);
+  // ---- (T45) 床レイヤーキャッシュ: タイル毎ループをdrawImage 1回に置換 ----
+  ensureFloorCache();
+  ctx.drawImage(FLOOR_CV,camX,camY,viewW,viewH,camX,camY,viewW,viewH);
+  drawFloorDynamics(x0,y0,x1,y1);
+  // ---- トラップ(尖刺/転移) ----
+  if(D.traps){
+    for(const tr of D.traps){
+      const px=tr.tx*TILE,py=tr.ty*TILE;
+      if(tr.kind==="spike"){
+        if(tr.armed){
+          // 尖刺: 見える(4本のスパイク)
+          ctx.fillStyle="rgba(0,0,0,.25)";
+          ctx.fillRect(px+2,py+2,TILE-4,TILE-4);
+          for(let si=0;si<4;si++){
+            const sx=px+7+(si%2)*14,sy=py+7+Math.floor(si/2)*14;
+            ctx.fillStyle="#b8b8c0";
+            ctx.beginPath();ctx.moveTo(sx-4,sy+6);ctx.lineTo(sx,sy-6);ctx.lineTo(sx+4,sy+6);ctx.closePath();ctx.fill();
+            ctx.fillStyle="rgba(255,255,255,.5)";
+            ctx.fillRect(sx-1,sy-4,2,6);
+          }
+        }else{
+          // 残骸(解除済み)
+          ctx.fillStyle="rgba(120,120,130,.35)";
+          for(let si=0;si<3;si++){
+            const sx=px+8+si*7,sy=py+16+(si%2)*4;
+            ctx.fillRect(sx,sy,3,5);
+          }
+        }
+      }else if(tr.kind==="teleport"){
+        if(tr.armed){
+          // 転移の紋(紫色のルーン)
+          const pa=0.5+0.3*Math.sin(G.time*4+tr.tx);
+          ctx.fillStyle="rgba(120,60,200,"+pa*0.35+")";
+          ctx.fillRect(px+3,py+3,TILE-6,TILE-6);
+          ctx.strokeStyle="rgba(190,120,255,"+pa+")";
+          ctx.lineWidth=2;
+          ctx.beginPath();ctx.arc(px+16,py+16,9,0,Math.PI*2);ctx.stroke();
+          ctx.beginPath();ctx.arc(px+16,py+16,4,0,Math.PI*2);ctx.stroke();
+        }else{
+          // 残骸(消えた紋の痕)
+          ctx.strokeStyle="rgba(120,60,200,.3)";
+          ctx.lineWidth=1.5;
+          ctx.beginPath();ctx.arc(px+16,py+16,8,0,Math.PI*2);ctx.stroke();
+        }
+      }
+    }
+  }
+  // ---- トラップ部屋のドア(開いた状態)とスイッチ ----
+  if(MAP.trapDoor&&!D.trapDoorLocked){
+    const px=MAP.trapDoor.x*TILE,py=MAP.trapDoor.y*TILE;
+    // 開いた石のドア(左右に半分開)
+    ctx.fillStyle="#5a5248";
+    ctx.fillRect(px,py-2,7,TILE+2);
+    ctx.fillRect(px+TILE-7,py-2,7,TILE+2);
+    ctx.fillStyle="rgba(0,0,0,.4)";
+    ctx.fillRect(px,py+TILE-4,7,4);
+    ctx.fillRect(px+TILE-7,py+TILE-4,7,4);
+  }
+  if(MAP.trapSwitch&&!D.trapDoorLocked){
+    const px=MAP.trapSwitch.x*TILE,py=MAP.trapSwitch.y*TILE;
+    const sa=0.6+0.3*Math.sin(G.time*5);
+    ctx.fillStyle="rgba(200,40,60,"+(0.25+0.15*Math.sin(G.time*5))+")";
+    ctx.fillRect(px+4,py+4,TILE-8,TILE-8);
+    ctx.strokeStyle="rgba(255,80,100,"+sa+")";
+    ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(px+16,py+16,8,0,Math.PI*2);ctx.stroke();
+    ctx.fillStyle="rgba(255,120,140,"+sa+")";
+    ctx.beginPath();ctx.arc(px+16,py+16,3.5,0,Math.PI*2);ctx.fill();
+  }
+  ctx.fillStyle=th.tint;ctx.globalAlpha=0.14;
+  ctx.fillRect(camX,camY,viewW,viewH);
+  ctx.globalAlpha=1;
+  // 突進警告(赤い経路)
+  const t=G.time;
+  for(const w of D.warnings){
+    const a=0.25+0.2*Math.sin(t*10);
+    for(const c of w.path){
+      ctx.fillStyle="rgba(255,70,50,"+a+")";
+      ctx.fillRect(c.x*TILE+2,c.y*TILE+2,TILE-4,TILE-4);
+    }
+  }
+  // 出口
+  img("stairs.png",MAP.exit.x*TILE-4,MAP.exit.y*TILE-4,40,40,"#444");
+  // (T48) 上り階段(=降りてきた場所/spawn): 階段スプライトを上下反転+上向き矢印で明示
+  if(MAP.upstairs)drawUpstairsSprite(MAP.upstairs);
+  if(MAP.gate)drawGateSprite(MAP.gate);
+  if(MAP.savept)drawSavepointSprite(MAP.savept);
+  for(const dr of D.drops)drawDrop(dr);
+  for(const c of D.chests){if(!c.open)img("chest.png",c.tx*TILE+TILE/2-14,c.ty*TILE+TILE/2-14,28,28,"#8a6a30");}
+  for(const e of D.enemies)drawEnemy(e);
+  if(P.summon)drawSummonSprite(P.summon);
+  drawPlayer(P);
+  // 敵弾(マスム中心)
+  for(const b of D.ebullets){
+    const bx=(b.tx+0.5)*TILE,by=(b.ty+0.5)*TILE;
+    ctx.fillStyle="rgba(0,0,0,.4)";
+    ctx.beginPath();ctx.arc(bx,by,9,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle=b.col||"#c84a4a";
+    ctx.beginPath();ctx.arc(bx,by,6,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="rgba(255,255,255,.8)";
+    ctx.beginPath();ctx.arc(bx,by,2.5,0,Math.PI*2);ctx.fill();
+  }
+  // プレイヤー弾(矢/魔弾/爆弾)
+  for(const b of D.pbullets){
+    const bx=b.x,by=b.y;
+    if(b.boom){
+      // 爆弾: 丸い弾+尾
+      ctx.fillStyle="rgba(0,0,0,.4)";
+      ctx.beginPath();ctx.arc(bx,by,8,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle=b.col||"#ff9a4a";
+      ctx.beginPath();ctx.arc(bx,by,5.5,0,Math.PI*2);ctx.fill();
+      ctx.fillStyle="rgba(255,255,255,.7)";
+      ctx.beginPath();ctx.arc(bx-b.dx*3,by-b.dy*3,2.5,0,Math.PI*2);ctx.fill();
+    }else{
+      ctx.save();
+      ctx.translate(bx,by);
+      ctx.rotate(Math.atan2(b.dy,b.dx));
+      ctx.fillStyle=b.col||"#ffd24a";
+      ctx.fillRect(-7,-1.8,14,3.6); // 矢/弾の軸
+      ctx.fillStyle="rgba(255,255,255,.9)";
+      ctx.fillRect(3,-2.5,5,5);
+      ctx.restore();
+    }
+  }
+  // ビーム(レーザー/波動)
+  if(D.beams){
+    for(const bm of D.beams){
+      const a=Math.max(0,bm.life/bm.max);
+      ctx.strokeStyle=bm.col||"#8ae8ff";
+      ctx.globalAlpha=a*0.9;
+      ctx.lineWidth=(bm.w||6)*a+1;
+      ctx.beginPath();ctx.moveTo(bm.x0,bm.y0);ctx.lineTo(bm.x1,bm.y1);ctx.stroke();
+      ctx.globalAlpha=a*0.5;
+      ctx.lineWidth=((bm.w||6)*2.2)*a+1;
+      ctx.strokeStyle="rgba(255,255,255,.8)";
+      ctx.beginPath();ctx.moveTo(bm.x0,bm.y0);ctx.lineTo(bm.x1,bm.y1);ctx.stroke();
+      ctx.globalAlpha=1;
+    }
+  }
+  for(const pt of D.particles){
+    ctx.globalAlpha=Math.max(0,Math.min(1,pt.life*2.5));
+    ctx.fillStyle=pt.col;
+    if(pt.bolt)ctx.fillRect(pt.x-2,pt.y-44,4,44);
+    else if(pt.ring){ctx.strokeStyle=pt.col;ctx.lineWidth=pt.lw||3;ctx.beginPath();ctx.arc(pt.x,pt.y,pt.r,0,Math.PI*2);ctx.stroke();}
+    else{ctx.beginPath();ctx.arc(pt.x,pt.y,pt.r,0,Math.PI*2);ctx.fill();}
+  }
+  ctx.globalAlpha=1;
+  // 溜め中のオーラ
+  if(P&&P.charging){
+    const ca=0.35+0.2*Math.sin(G.time*12);
+    ctx.strokeStyle="rgba(255,210,74,"+ca+")";
+    ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(P.x,P.y,20+2*Math.sin(G.time*12),0,Math.PI*2);ctx.stroke();
+    for(let i=0;i<6;i++){
+      const a=G.time*5+i/6*Math.PI*2;
+      ctx.fillStyle="rgba(255,210,74,"+ca+")";
+      ctx.beginPath();ctx.arc(P.x+Math.cos(a)*24,P.y+Math.sin(a)*24,2,0,Math.PI*2);ctx.fill();
+    }
+  }
+  ctx.textAlign="center";
+  for(const f of D.floats){
+    if(f.flash){
+      // タイルフラッシュ(罠/ハザード発火)
+      ctx.globalAlpha=Math.min(1,f.life*2);
+      ctx.fillStyle=f.flash+"0.8)";
+      ctx.fillRect(f.tx*TILE,f.ty*TILE,TILE,TILE);
+      continue;
+    }
+    ctx.globalAlpha=Math.min(1,f.life*2);
+    ctx.fillStyle=f.col;
+    ctx.font="bold "+(f.size||14)+"px sans-serif";
+    ctx.fillText(f.txt,f.x,f.y);
+  }
+  ctx.globalAlpha=1;
+  ctx.restore();
+  // スクリーンオーバーレイ: 閃光(白)/転移(紫)
+  if(D.flashT>0){
+    ctx.fillStyle="rgba(255,255,240,"+Math.min(0.9,D.flashT*3.5)+")";
+    ctx.fillRect(0,0,W,H);
+  }
+  if(D.teleT>0){
+    ctx.fillStyle="rgba(120,50,200,"+Math.min(0.85,D.teleT*2.2)+")";
+    ctx.fillRect(0,0,W,H);
+  }
+  // スクリーン歪み(無職必殺「万象崩し」)
+  if(D.warpT>0){
+    const wt=Math.min(1,D.warpT*2);
+    for(let i=0;i<6;i++){
+      const y0=(i/6)*H+Math.sin(G.time*22+i*1.9)*10*wt;
+      ctx.fillStyle="rgba(170,60,255,"+(0.10*wt)+")";
+      ctx.fillRect(0,y0,W,10+10*wt);
+    }
+  }
+  // スクリーン空間: HUD情報
+  ctx.textAlign="left";
+  ctx.fillStyle="rgba(255,215,122,.85)";ctx.font="bold 16px sans-serif";
+  ctx.fillText(D.floor+"F  "+D.theme.name,14,24);
+  ctx.fillStyle="rgba(200,190,150,.6)";ctx.font="12px sans-serif";
+  ctx.fillText("ターン "+D.turn,14,42);
+  if(TURN.phase!=="player"){
+    ctx.fillStyle="rgba(126,200,255,.7)";
+    ctx.fillText(TURN.phase==="enemy"?"敵のターン…":"",14,58);
+  }
+  // ボスHPバー((T41)中ボスも対象)
+  for(const e of D.enemies){
+    if((e.id==="boss_karaage"||e.mini)&&!e.dead){
+      ctx.fillStyle="rgba(0,0,0,.7)";
+      ctx.fillRect(W/2-250,H-42,500,14);
+      ctx.fillStyle=e.mini?e.col:"#e8942e";
+      ctx.fillRect(W/2-248,H-40,496*Math.max(0,e.hp/e.hpMax),10);
+      ctx.fillStyle="#ffd97a";ctx.font="bold 14px sans-serif";ctx.textAlign="center";
+      ctx.fillText(e.mini?e.name+" [中ボス]":"唐揚げ魔王",W/2,H-48);
+      break;
+    }
+  }
+}
+function drawGateSprite(g){
+  const px=g.x*TILE,py=g.y*TILE;
+  const t=G.time;
+  img("gate.png",px-6,py-10,44,52,"#6a4a9a");
+  ctx.fillStyle="rgba(160,110,255,"+(0.4+0.3*Math.sin(t*4))+")";
+  ctx.beginPath();ctx.ellipse(px+16,py+16,10,16,0,0,Math.PI*2);ctx.fill();
+}
+function drawSavepointSprite(g){
+  const px=g.x*TILE,py=g.y*TILE;
+  const t=G.time;
+  img("savepoint.png",px-4,py-6,40,44,"#c8a04a");
+  ctx.fillStyle="rgba(255,230,140,"+(0.3+0.3*Math.sin(t*3))+")";
+  ctx.beginPath();ctx.arc(px+16,py+8,6,0,Math.PI*2);ctx.fill();
+}
+// (T48) 上り階段(=降りてきた場所/spawn): stairs.pngを上下反転して描画+緑の上向き矢印で「上へ(一階上/1Fは地上)」を明示
+function drawUpstairsSprite(u){
+  const px=u.x*TILE,py=u.y*TILE,t=G.time;
+  ctx.save();
+  ctx.translate(px+TILE/2,py+TILE/2);
+  ctx.scale(1,-1);
+  img("stairs.png",-TILE/2-4,-TILE/2-4,40,40,"#444");
+  ctx.restore();
+  const a=0.55+0.35*Math.sin(t*4);
+  ctx.fillStyle="rgba(120,255,150,"+a+")";
+  ctx.beginPath();
+  ctx.moveTo(px+TILE/2,py+3);
+  ctx.lineTo(px+TILE/2-6,py+11);
+  ctx.lineTo(px+TILE/2-2.5,py+11);
+  ctx.lineTo(px+TILE/2-2.5,py+19);
+  ctx.lineTo(px+TILE/2+2.5,py+19);
+  ctx.lineTo(px+TILE/2+2.5,py+11);
+  ctx.lineTo(px+TILE/2+6,py+11);
+  ctx.closePath();ctx.fill();
+}
+function drawDrop(dr){
+  const yy=dr.y+Math.sin(dr.bob)*3;
+  if(dr.id==="gold")img("icon_gold.png",dr.x-10,yy-10,20,20,"#ffd24a");
+  else if(dr.id==="exp")img("icon_exp.png",dr.x-9,yy-9,18,18,"#7ec8ff");
+  else{
+    const it=ALL_ITEMS[dr.id];
+    if(it)img(it.img,dr.x-10,yy-10,20,20,"#8a5a5a");
+  }
+}
+// スプライト描画: 待機=1フレーム+バウンド / 移動=2フレーム切替
+function spriteFrame(base,walkId,moving){
+  if(moving&&walkId&&IMG[walkId]&&IMG[walkId]._ok&&Math.floor(G.time*9)%2===1)return IMG[walkId];
+  return IMG[base];
+}
+// (T46) スプライトの着色シルエット(不透明部分のみ) — 初回生成後はImageオブジェクトにキャッシュ
+// 被弾フラッシュ用。旧: 白い矩形オーバーレイ(透過四隅まで白くなる→「背景が白くなる」バグ)
+// 毎フレームコストはdrawImage 1回のみ(旧ctx.filter方式より軽量)
+function tintOf(im,cacheProp,css){
+  if(!im||!im._ok)return null;
+  const cached=im[cacheProp];
+  if(cached)return cached;
+  const w=im.naturalWidth||im.width,h=im.naturalHeight||im.height;
+  if(!w||!h)return null;
+  const cv2=document.createElement("canvas");
+  cv2.width=w;cv2.height=h;
+  const c2=cv2.getContext("2d");
+  c2.drawImage(im,0,0,w,h);
+  c2.globalCompositeOperation="source-in";
+  c2.fillStyle=css;
+  c2.fillRect(0,0,w,h);
+  im[cacheProp]=cv2;
+  return cv2;
+}
+function drawEnemy(e){
+  const s=e.size/2;
+  const bob=Math.sin(G.time*3+e.animT*2)*2;
+  const flash=e.hitT>0;
+  ctx.save();
+  ctx.translate(e.x,e.y+bob);
+  if(e.freezeT>0){
+    ctx.fillStyle="rgba(150,220,255,.35)";
+    ctx.beginPath();ctx.arc(0,0,e.r+5,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="rgba(220,245,255,.9)";ctx.font="bold 12px sans-serif";ctx.textAlign="center";
+    ctx.fillText("❄",0,-e.r-8);
+  }
+  ctx.fillStyle="rgba(0,0,0,.35)";
+  ctx.beginPath();ctx.ellipse(0,e.r*0.7,e.r*0.8,e.r*0.35,0,0,Math.PI*2);ctx.fill();
+  if(e.id==="mimic"){
+    // ミミック: 宝箱の体+顎+眼
+    const cm=IMG["chest.png"];
+    if(cm&&cm._ok){
+      ctx.drawImage(cm,-e.r,-e.r,e.r*2,e.r*2);
+      // (T46) 被弾フラッシュ: 白いシルエット(不透明部分のみ) — 旧矩形オーバーレイは透過四隅も白く塗るバグ
+      if(flash){const ws=tintOf(cm,"_white","#fff");if(ws)ctx.drawImage(ws,-e.r,-e.r,e.r*2,e.r*2);}
+    }else{
+      ctx.fillStyle=flash?"#fff":"#8a6a30";
+      ctx.fillRect(-e.r,-e.r,e.r*2,e.r*2);
+    }
+    const jaw=Math.abs(Math.sin(G.time*6))*4;
+    ctx.fillStyle="#5a3a1a";
+    ctx.fillRect(-e.r+2,e.r*0.15,e.r*2-4,4+jaw);
+    ctx.fillStyle="#fff";
+    for(let ti=0;ti<4;ti++)ctx.fillRect(-e.r+5+ti*(e.r*2-10)/3,e.r*0.15+2,3,3+jaw*0.5);
+    ctx.fillStyle="#ff3040";
+    ctx.beginPath();ctx.arc(0,-e.r*0.4,3,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+    if(e.hp<e.hpMax){
+      const w=e.r*2;
+      ctx.fillStyle="rgba(0,0,0,.6)";
+      ctx.fillRect(e.x-w/2,e.y-e.r-10,w,4);
+      ctx.fillStyle="#e04040";
+      ctx.fillRect(e.x-w/2,e.y-e.r-10,w*Math.max(0,e.hp/e.hpMax),4);
+    }
+    return;
+  }
+  const isBoss=e.id==="boss_karaage"||e.mini;
+  const moving=Math.hypot((e.tx+0.5)*TILE-e.x,(e.ty+0.5)*TILE-e.y)>2;
+  const im=spriteFrame(e.id+".png",e.id+"_walk.png",moving);
+  if(im&&im._ok){
+    const flip=DIRS[e.dirIdx][0]<0?-1:1;
+    const sc=isBoss?1.6:1;
+    ctx.scale(flip*sc,sc);
+    ctx.drawImage(im,-s/2,-s/2,s,s);
+    // (T46) 被弾フラッシュ: 白いシルエット(不透明部分のみ) — 旧矩形オーバーレイは透過四隅も白く塗るバグ
+    if(flash){const ws=tintOf(im,"_white","#fff");if(ws)ctx.drawImage(ws,-s/2,-s/2,s,s);}
+  }else{
+    ctx.fillStyle=flash?"#fff":e.col;
+    ctx.beginPath();ctx.arc(0,0,e.r,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle="rgba(0,0,0,.5)";
+    ctx.beginPath();ctx.arc(-e.r*0.3,-2,2.5,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(e.r*0.3,-2,2.5,0,Math.PI*2);ctx.fill();
+  }
+  ctx.restore();
+  if(e.hp<e.hpMax&&!isBoss){
+    const w=e.r*2;
+    ctx.fillStyle="rgba(0,0,0,.6)";
+    ctx.fillRect(e.x-w/2,e.y-e.r-10,w,4);
+    ctx.fillStyle="#e04040";
+    ctx.fillRect(e.x-w/2,e.y-e.r-10,w*Math.max(0,e.hp/e.hpMax),4);
+  }
+  if(e.chargeWarn){
+    ctx.fillStyle="rgba(255,90,60,.95)";ctx.font="bold 13px sans-serif";ctx.textAlign="center";
+    ctx.fillText("⚠突進",e.x,e.y-e.r-16);
+  }
+}
+function drawSummonSprite(s){
+  const t=G.time;
+  ctx.save();
+  ctx.translate(s.x,s.y+Math.sin(t*5)*3);
+  const sdef=SUMMON_BY[s.id];
+  const scale=0.8+s.stage*0.06;
+  const moving=Math.hypot((s.tx+0.5)*TILE-s.x,(s.ty+0.5)*TILE-s.y)>2;
+  const im=spriteFrame(sdef.img,sdef.img.replace(".png","_walk.png"),moving);
+  if(im&&im._ok){
+    const flip=DIRS[s.dirIdx][0]<0?-1:1;
+    ctx.scale(flip*scale,scale);
+    ctx.drawImage(im,-32,-32,64,64);
+  }else{
+    ctx.fillStyle=sdef.col;
+    ctx.beginPath();ctx.arc(0,0,12*scale,0,Math.PI*2);ctx.fill();
+  }
+  if(s.atkBuffT>0){
+    ctx.strokeStyle="rgba(255,210,90,"+(0.5+0.4*Math.sin(t*8))+")";
+    ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(0,0,26*scale,0,Math.PI*2);ctx.stroke();
+  }
+  ctx.restore();
+  ctx.fillStyle="rgba(255,255,255,.55)";ctx.font="10px sans-serif";ctx.textAlign="center";
+  ctx.fillText("Lv"+s.stage,s.x,s.y-22);
+}
+function drawPlayer(P){
+  const t=G.time;
+  const ang=dirAngle(P.dirIdx);
+  const v=DIRS[P.dirIdx];
+  const moving=Math.hypot((P.tx+0.5)*TILE-P.x,(P.ty+0.5)*TILE-P.y)>2;
+  const flying=isFlying();
+  const bob=moving?Math.sin(t*16)*2:(flying?Math.sin(t*4)*4-6:Math.sin(t*3)*1.5);
+  const flash=P.hitT>0;
+  ctx.save();
+  // 向いているマスのハイライト(世界座標: 常に正確な対象マス)
+  ctx.fillStyle="rgba(255,210,90,.10)";
+  ctx.fillRect((P.tx+v[0])*TILE+3,(P.ty+v[1])*TILE+3,TILE-6,TILE-6);
+  ctx.translate(P.x,P.y);
+  // 影: 飛翔中は浮いていて影が小さい
+  ctx.fillStyle=flying?"rgba(0,0,0,.22)":"rgba(0,0,0,.35)";
+  ctx.beginPath();ctx.ellipse(0,flying?13:10,flying?8:12,flying?3.5:5,0,0,Math.PI*2);ctx.fill();
+  const im=spriteFrame(SAVE.job+".png",SAVE.job+"_walk.png",moving);
+  const s=34;
+  if(im&&im._ok){
+    // (T51b) 内容bbox正規化(静的テーブルSPRITE_BB): 静止フレームの「内容の見かけサイズ」
+    //        rc[2]*s/rW × rc[3]*s/rH を基準に、現フレームの内容(source rect=SPRITE_BB)を
+    //        同一の見かけサイズで描画 = 静止/歩行で表示サイズが完全一致(歩行時縮小の修正)。
+    //        (T51の実行時計測は環境によりサイレント失敗し再発したためオフライン実測値に置換)
+    const refN=SAVE.job+".png";
+    const curN=(im===IMG[refN])?refN:SAVE.job+"_walk.png";
+    const ref=IMG[refN];
+    const rW=ref?(ref.naturalWidth||ref.width):0,rH=ref?(ref.naturalHeight||ref.height):0;
+    const bb=SPRITE_BB[curN]||null,rc=SPRITE_BB[refN]||null;
+    let sx=0,sy=0,sw=im.naturalWidth||im.width,sh=im.naturalHeight||im.height,dw=s,dh=s;
+    if(bb&&rc&&rW&&rH){
+      sx=bb[0];sy=bb[1];sw=bb[2];sh=bb[3];
+      dw=rc[2]*s/rW;
+      dh=rc[3]*s/rH;
+    }
+    // (T53) 体の向き(faceX)と狙い方向(dirIdx)の分離: 横スクロール系スプライトのため、
+    //        上下移動(dirIdx=2/6で水平成分なし)で右向きにリセットされないよう、
+    //        水平方向の移動/転換でfaceXのみ更新し、それ以外は維持する。
+    if(DIRS[P.dirIdx][0]!==0)P.faceX=DIRS[P.dirIdx][0];
+    const flip=(P.faceX||1)<0?-1:1;
+    ctx.save();
+    ctx.translate(0,bob);
+    ctx.scale(flip,1);
+    ctx.drawImage(im,sx,sy,sw,sh,-dw/2,-dh/2,dw,dh);
+    // (T46) 被弾フラッシュ(暗転): 暗色シルエット(不透明部分のみ) — 旧矩形オーバーレイは透過四隅も塗るバグ
+    // (T51) フラッシュも同じsource rectで描画し、本体とシルエットのサイズを一致させる
+    if(flash){const ds=tintOf(im,"_dark","rgba(20,30,60,.75)");if(ds)ctx.drawImage(ds,sx,sy,sw,sh,-dw/2,-dh/2,dw,dh);}
+    ctx.restore();
+  }else{
+    ctx.save();
+    ctx.translate(0,bob);
+    ctx.fillStyle=flash?"#fff":"#5a8ad0";
+    ctx.beginPath();ctx.arc(0,0,13,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+  }
+  // 向きを示す矢印(スプライトのscale空間の外で描画)
+  ctx.rotate(ang);
+  ctx.fillStyle="rgba(255,215,122,.8)";
+  ctx.beginPath();
+  ctx.moveTo(26,0);ctx.lineTo(19,-5);ctx.lineTo(19,5);
+  ctx.closePath();ctx.fill();
+  ctx.rotate(-ang);
+  if(P.swing>0){
+    const prog=1-P.swing/0.22;
+    const a=ang-1.2+prog*2.4;
+    ctx.strokeStyle="rgba(255,255,255,.85)";
+    ctx.lineWidth=4;
+    ctx.beginPath();ctx.arc(0,bob,24,a-0.5,a+0.5);ctx.stroke();
+  }
+  ctx.restore();
+  if(P.guardT>0){
+    ctx.strokeStyle="rgba(140,230,255,"+(0.4+0.4*Math.sin(t*10))+")";
+    ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(P.x,P.y,22,0,Math.PI*2);ctx.stroke();
+  }
+  if(P.dashBonusT>0){
+    ctx.fillStyle="rgba(255,90,90,"+(0.2+0.2*Math.sin(t*12))+")";
+    ctx.beginPath();ctx.arc(P.x,P.y,20,0,Math.PI*2);ctx.fill();
+  }
+  if(isFlying()){
+    // 飛翔: 足元の光の輪+羽の粒子
+    ctx.strokeStyle="rgba(190,230,255,"+(0.35+0.3*Math.sin(t*8))+")";
+    ctx.lineWidth=2;
+    ctx.beginPath();ctx.ellipse(P.x,P.y+11,15,6,0,0,Math.PI*2);ctx.stroke();
+    if(Math.random()<0.25)globalThis.P(P.x+(Math.random()-0.5)*18,P.y+6,(Math.random()-0.5)*0.8,-0.6,0.5,"#d8efff",1.5); // パラメータPがグローバルのパーティクル関数を隠蔽するためglobalThis経由
+  }
+}
+function drawHUD(){
+  if(G.screen!=="dungeon"&&G.screen!=="town")return;
+  if(!SAVE)return;
+  const d=dStats();
+  ctx.fillStyle="rgba(12,10,8,.72)";
+  ctx.fillRect(8,8,252,88);
+  ctx.strokeStyle="#6a5a30";ctx.strokeRect(8,8,252,88);
+  img(SAVE.job+".png",14,14,52,52,"#556");
+  ctx.textAlign="left";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 14px sans-serif";
+  ctx.fillText(JOBS[SAVE.job].name+"  Lv."+SAVE.lv,74,28);
+  ctx.fillStyle="#8a2a2a";ctx.fillRect(74,36,172,10);
+  ctx.fillStyle="#e04040";ctx.fillRect(74,36,172*Math.max(0,Math.min(1,SAVE.hp/d.hpMax)),10);
+  ctx.fillStyle="#fff";ctx.font="10px sans-serif";
+  ctx.fillText("HP "+Math.ceil(SAVE.hp)+"/"+d.hpMax,78,44);
+  ctx.fillStyle="#2a2a6a";ctx.fillRect(74,50,172,10);
+  ctx.fillStyle="#4a6ae0";ctx.fillRect(74,50,172*Math.max(0,Math.min(1,SAVE.mp/d.mpMax)),10);
+  ctx.fillText("MP "+Math.ceil(SAVE.mp)+"/"+d.mpMax,78,58);
+  ctx.fillStyle="#222";ctx.fillRect(74,64,172,6);
+  ctx.fillStyle="#7ec8ff";ctx.fillRect(74,64,172*Math.min(1,SAVE.xp/xpNeed(SAVE.lv)),6);
+  const skills=JOBS[SAVE.job].skills;
+  const keys=["X","C","V"];
+  for(let i=0;i<3;i++){
+    const x=74+i*58,y=74;
+    const p=DUNGEON?DUNGEON.player:null;
+    const cd=p?p.skillCd[i]:0;
+    ctx.fillStyle="rgba(40,35,25,.9)";ctx.fillRect(x,y,54,14);
+    ctx.strokeStyle="#6a5a30";ctx.strokeRect(x,y,54,14);
+    ctx.fillStyle=cd>0?"#888":"#ffd97a";ctx.font="9px sans-serif";
+    ctx.fillText(keys[i]+" "+skills[i].name.slice(0,4),x+3,y+10);
+    if(cd>0){ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(x,y,54*(cd/skills[i].cd),14);}
+  }
+  ctx.textAlign="right";
+  ctx.fillStyle="#ffd24a";ctx.font="bold 15px sans-serif";
+  ctx.fillText(SAVE.gold+"G",W-14,26);
+  if(G.screen==="dungeon"&&DUNGEON){
+    ctx.fillStyle="#e8d9a0";ctx.font="13px sans-serif";
+    ctx.fillText("最深記録 "+SAVE.maxFloor+"F",W-14,46);
+  }
+  ctx.textAlign="left";
+  ctx.fillStyle="rgba(200,190,150,.7)";ctx.font="11px sans-serif";
+  const we=SAVE.equip.weapon&&ALL_ITEMS[SAVE.equip.weapon]?ALL_ITEMS[SAVE.equip.weapon].name:"-"; // (T49) 無効ID耐性
+  const ar=SAVE.equip.armor&&ALL_ITEMS[SAVE.equip.armor]?ALL_ITEMS[SAVE.equip.armor].name:"-";
+  ctx.fillText("武:"+we+"  防:"+ar,8,106);
+  // 飛翔インジケーター (T32)
+  const pl2=DUNGEON?DUNGEON.player:null;
+  if(G.screen==="dungeon"&&pl2&&isFlying()){
+    ctx.fillStyle="rgba(190,230,255,.95)";ctx.font="bold 11px sans-serif";
+    ctx.fillText("羽:"+((pl2.flyT>0)?pl2.flyT+"ターン残り":"飛翔防具"),8,121);
+  }
+}
+function drawOverlays(){
+  if(UI.stairs){drawStairsChoice();return;} // (T49) 階段の選択肢は最優先(表示中はターン停止)
+  if(UI.bag){drawBag();return;}
+  if(UI.gate&&UI.gate.open)drawGateMenu();
+  else if(UI.shop)drawShop();
+  else if(UI.sell)drawSellMenu();
+  if(G.help)drawHelp();
+}
+function drawBag(){
+  bagInput();
+  const b=UI.bag;
+  ctx.fillStyle="rgba(0,0,0,.68)";ctx.fillRect(0,0,W,H);
+  panel(W/2-330,30,660,480,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 24px serif";
+  ctx.fillText("装備・アイテム",W/2,68);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("↑↓ 選択    Z: 装備/使用    X: 売却(半額)    Esc/I/Tab: 閉じる    (ターンは消費しない)",W/2,92);
+  // 現在装備
+  const slots=[["武器",SAVE.equip.weapon],["防具",SAVE.equip.armor],["指輪",SAVE.equip.ring]];
+  for(let i=0;i<3;i++){
+    const x=W/2-306+i*205,y=106;
+    const label=slots[i][0],id=slots[i][1];
+    panel(x,y,195,92,false);
+    const it=id?ALL_ITEMS[id]:null;
+    ctx.textAlign="left";
+    ctx.fillStyle="#c8b070";ctx.font="bold 12px sans-serif";
+    ctx.fillText(label,x+12,y+22);
+    ctx.fillStyle=it?"#ffd97a":"#777";ctx.font="bold 14px sans-serif";
+    ctx.fillText(it?it.name:"なし",x+12,y+46);
+    if(it){
+      ctx.fillStyle="rgba(220,210,170,.85)";ctx.font="11px sans-serif";
+      let st="";
+      if(it.atk)st+=" 攻+"+it.atk;
+      if(it.mag)st+=" 魔+"+it.mag;
+      if(it.def)st+=" 守+"+it.def;
+      if(it.spd)st+=" 速+"+it.spd;
+      ctx.fillText(st,x+12,y+68);
+    }
+  }
+  // バッグ
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="bold 13px sans-serif";ctx.textAlign="left";
+  ctx.fillText("所持品 ("+SAVE.inv.length+")   所持金 "+SAVE.gold+"G",W/2-306,222);
+  if(!SAVE.inv.length){
+    ctx.fillStyle="#888";ctx.textAlign="center";ctx.font="14px sans-serif";
+    ctx.fillText("何もない",W/2,320);
+  }
+  for(let i=0;i<SAVE.inv.length;i++){
+    const y=232+i*34;
+    if(y>470)break;
+    const it=SAVE.inv[i];
+    const def=ALL_ITEMS[it.id];
+    if(!def)continue;
+    const sel=b.sel===i;
+    panel(W/2-306,y,612,30,sel);
+    const slotName=itemSlotOf(def)?{weapon:"武",armor:"防",ring:"輪"}[itemSlotOf(def)]:"消";
+    ctx.textAlign="left";
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";
+    ctx.font=(sel?"bold ":"")+"13px sans-serif";
+    ctx.fillText("["+slotName+"] "+def.name+" ×"+it.n,W/2-292,y+20);
+    if(sel&&def.desc){
+      ctx.fillStyle="rgba(200,190,150,.7)";ctx.font="11px sans-serif";
+      ctx.fillText(def.desc,W/2+60,y+20);
+    }
+    if(def.img)img(def.img,W/2+272,y+3,24,24,"#665");
+  }
+}
+function drawGateMenu(){
+  const g=UI.gate;
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(0,0,W,H);
+  panel(W/2-270,50,540,440,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#c8a0ff";ctx.font="bold 24px serif";
+  ctx.fillText("ワープゲート",W/2,92);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("解放された階を選択  ← → 選択  Z:移動  X:戻る",W/2,118);
+  // (T41→T54) 解放済みゲート(中ボス討伐後): 地上(町)ボタン
+  if(g.town){
+    const sel=g.sel===-1;
+    panel(W/2-130,128,260,40,sel);
+    ctx.fillStyle=sel?"#ffd24a":"#bfe8ff";ctx.font="bold 18px sans-serif";
+    ctx.fillText("地上(町)へ戻る",W/2,154);
+  }
+  const cols=4;
+  const gridTop=g.town?180:140;
+  for(let i=0;i<g.list.length;i++){
+    const c=i%cols,r=Math.floor(i/cols);
+    if(r>6)break;
+    const x=W/2-270+28+c*128,y=gridTop+r*54;
+    const sel=g.sel===i;
+    panel(x,y,112,44,sel);
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font="bold 18px sans-serif";
+    ctx.fillText(g.list[i]+"F",x+56,y+28);
+  }
+  if(!g.list.length){ctx.fillStyle="#888";ctx.font="14px sans-serif";ctx.fillText("解放されたワープゲートはまだありません (10F帯の中ボスを討伐して解放)",W/2,300);}
+  {
+    const n=g.town?g.list.length+1:g.list.length;
+    const idx=g.sel===-1?0:g.sel; // 論理インデックス(0=地上)
+    if(key("ArrowUp","KeyW")&&!G._g1){G._g1=true;if(g.town&&n>0){g.sel=-1;playSFX("sfx_click.ogg",1.1);}}
+    if(!key("ArrowUp","KeyW"))G._g1=false;
+    if(key("ArrowDown","KeyS")&&!G._g3){G._g3=true;if(g.town&&g.sel===-1&&g.list.length){g.sel=0;playSFX("sfx_click.ogg",1.1);}}
+    if(!key("ArrowDown","KeyS"))G._g3=false;
+    if(key("ArrowLeft","KeyA")&&!G._g2){G._g2=true;if(n>0&&g.sel!==-1){g.sel=(g.sel-1+g.list.length)%g.list.length;playSFX("sfx_click.ogg",1.1);}}
+    if(!key("ArrowLeft","KeyA"))G._g2=false;
+    if(key("ArrowRight","KeyD")&&!G._g4){G._g4=true;if(n>0&&g.sel!==-1){g.sel=(g.sel+1)%g.list.length;playSFX("sfx_click.ogg",1.1);}}
+    if(!key("ArrowRight","KeyD"))G._g4=false;
+  }
+  if(keyP("KeyZ","Enter"))gateSelect();
+  if(keyP("KeyX","Escape"))closeOverlay();
+}
+// (T49) 降り階段の「降りる/留まる」選択ダイアログ (矢印:切り替え Z:決定 X/Esc:留まる)
+function drawStairsChoice(){
+  const s=UI.stairs;
+  if(!s)return;
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(0,0,W,H);
+  panel(W/2-240,H/2-110,480,220,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#bfe8ff";ctx.font="bold 22px serif";
+  ctx.fillText("降りる?",W/2,H/2-68);
+  ctx.fillStyle="rgba(220,210,170,.8)";ctx.font="13px sans-serif";
+  ctx.fillText(stairsSubText(s.from),W/2,H/2-44); // (T55) 計算後に結合
+  const opts=[
+    {t:stairsDescendText(s.from),col:"#bfe8ff"}, // (T55) 計算後に結合(旧: "11F"/"41F"/"101F"バグ)
+    {t:"留まる",col:"#e8d9a0"}
+  ];
+  for(let i=0;i<2;i++){
+    const sel=s.sel===i;
+    panel(W/2-180,H/2-24+i*54,360,44,sel);
+    ctx.fillStyle=sel?"#ffd24a":opts[i].col;ctx.font="bold 18px sans-serif";
+    ctx.fillText(opts[i].t,W/2,H/2+4+i*54);
+  }
+  ctx.fillStyle="rgba(220,210,170,.6)";ctx.font="12px sans-serif";
+  ctx.fillText("← → / ↑ ↓ 切り替え    Z: 決定    X / Esc: 留まる",W/2,H/2+92);
+  // 矢印キー: エッジ検出で2択を切り替え(長押しで往復しない)
+  if(key("ArrowLeft","KeyA")||key("ArrowUp","KeyW")){
+    if(!G._scL){G._scL=true;if(s.sel!==0){s.sel=0;playSFX("sfx_click.ogg",1.1);}}
+  }else G._scL=false;
+  if(key("ArrowRight","KeyD")||key("ArrowDown","KeyS")){
+    if(!G._scR){G._scR=true;if(s.sel!==1){s.sel=1;playSFX("sfx_click.ogg",1.1);}}
+  }else G._scR=false;
+  if(keyP("KeyZ","Enter"))stairsChoose();
+  if(keyP("KeyX","Escape"))closeOverlay();
+}
+function drawShop(){
+  const s=UI.shop;
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(0,0,W,H);
+  panel(W/2-310,50,620,440,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 24px serif";
+  ctx.fillText(s.title,W/2,88);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("← → 選択  Z:購入  X:閉じる   所持金 "+SAVE.gold+"G",W/2,112);
+  for(let i=0;i<s.list.length;i++){
+    const y=136+i*40;
+    if(y>462)break;
+    const sel=s.sel===i;
+    panel(W/2-280,y,560,34,sel);
+    ctx.textAlign="left";
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";
+    ctx.font=(sel?"bold ":"")+"14px sans-serif";
+    wrapLine(s.label(s.list[i]),W/2-264,y+22,480);
+    const it=s.list[i];
+    if(it.img)img(it.img,W/2+232,y+3,28,28,"#665");
+  }
+  if(keyR("ArrowUp","KeyW")){shopNav(-1);playSFX("sfx_click.ogg",1.1);}
+  if(keyR("ArrowDown","KeyS")){shopNav(1);playSFX("sfx_click.ogg",1.1);}
+  if(keyP("KeyZ","Enter"))shopBuy();
+  if(keyP("KeyX","Escape"))closeOverlay();
+}
+function wrapLine(txt,x,y,mw){
+  ctx.save();
+  ctx.textAlign="left";
+  ctx.fillText(txt,x,y);
+  ctx.restore();
+}
+function drawSellMenu(){
+  ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(0,0,W,H);
+  panel(W/2-310,50,620,440,true);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 24px serif";
+  ctx.fillText("古物商「宝」— 売却",W/2,88);
+  ctx.fillStyle="rgba(220,210,170,.7)";ctx.font="13px sans-serif";
+  ctx.fillText("← → 選択  Z:売却  X:閉じる   所持金 "+SAVE.gold+"G",W/2,112);
+  if(!SAVE.inv.length){ctx.fillStyle="#888";ctx.font="14px sans-serif";ctx.fillText("売れるものがない",W/2,300);}
+  for(let i=0;i<SAVE.inv.length;i++){
+    const y=136+i*38;
+    if(y>462)break;
+    const it=SAVE.inv[i];
+    const def=ALL_ITEMS[it.id];
+    const sel=UI.sell.sel===i;
+    panel(W/2-280,y,560,32,sel);
+    ctx.textAlign="left";
+    const name=def?def.name:it.id;
+    const price=def?Math.max(1,Math.floor(def.price*0.5*it.n)):0;
+    ctx.fillStyle=sel?"#ffd24a":"#e8d9a0";ctx.font="14px sans-serif";
+    ctx.fillText(name+" ×"+it.n+"   (売却 "+price+"G)",W/2-264,y+21);
+    if(def&&def.img)img(def.img,W/2+232,y+2,28,28,"#665");
+  }
+  if(keyR("ArrowUp","KeyW")){shopNav(-1);playSFX("sfx_click.ogg",1.1);}
+  if(keyR("ArrowDown","KeyS")){shopNav(1);playSFX("sfx_click.ogg",1.1);}
+  if(keyP("KeyZ","Enter"))shopBuy();
+  if(keyP("KeyX","Escape"))closeOverlay();
+}
+function drawHelp(){
+  ctx.fillStyle="rgba(0,0,0,.7)";ctx.fillRect(0,0,W,H);
+  panel(W/2-330,20,660,508,true); // (T50) タッチ操作行追加で高さを拡張
+  ctx.textAlign="left";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 20px serif";
+  ctx.fillText("操作説明",W/2-300,58);
+   const lines=[
+    "■ ターン制: 1行動=1ターン。待機中なら敵も動かない",
+    "移動: WASD / 矢印キー (8方向・1マス)",
+    "タッチ: 左下8パッド=移動(長押し=連続)  左上スティック=方向転換(ターン消費なし)",
+    "攻撃: Z / J (向いているマス)   待機: Space",
+    "  斜め攻撃は壁を挟む場合不可。壁にぶつかるとぶつかった音(向き変更のみ・ターン消費なし)",
+    "スキル: X / C / V (K / Lでも可)   アイテム使用: 1 / 2 / 3 (1ターン)",
+    "装備・アイテム整理: Tab / I (ターン消費なし)",
+    "ポーズ: P / Esc     町でも薬: 1/2/3(自由)",
+    "飛翔: ポーズ(P)中のFで「羽ばたく風」(賢者) / 翼の羽衣・ペガサスの鎧",
+    "",
+    "■ ゴール: 100階の「唐揚げ魔王」を倒し、伝説の唐揚げを手にする",
+    "■ 敵の赤い経路=次のターンに突進する兆し。横に避けろ",
+    "■ 敵の弾は毎ターン1マス進む。そのマスを離れれば回避",
+    "■ 死亡時は装備・金・アイテムを全て失う(レベルと解放階は保持)",
+    "■ 上り階段(緑矢印)=降りてきた場所(入口)に常時設置。待機(Space)で**一階上**へ(1Fは地上へ)",
+    "■ 降り階段=各階の奥に1つ。上り階段で降りた先は常にその隣に到着",
+    "■ 降り階段を踏むと「降りる/留まる」の選択。降りるは選択したときだけ(自動降下なし)",
+    "",
+    "■ ジョブごとの成長:",
+    "  勇者: 武器を使うほど習熟が上がり威力が増す",
+    "  聖騎士: 神聖の盾で次の敵ターンを75%カット",
+    "  賢者: 魔法で戦う。ポーズ(P)から「羽ばたく風」で飛行",
+    "  召喚士: 召喚獣が毎ターン自動戦闘し実戦で進化",
+    "  無職: 初期ゼロだが成長が誰より速い。万能器用で戦う"
+   ];
+  ctx.fillStyle="#e8d9a0";ctx.font="14px sans-serif";
+  lines.forEach(function(l,i){ctx.fillText(l,W/2-300,88+i*17);}); // (T50) 行追加で行間を17pxに圧縮
+  ctx.textAlign="center";
+  ctx.fillStyle="#888";ctx.font="13px sans-serif";
+  ctx.fillText("X / Esc で閉じる",W/2,516);
+  if(keyP("KeyX","Escape")){G.help=false;playSFX("sfx_click.ogg");}
+}
+function drawPause(){
+  ctx.fillStyle="rgba(0,0,0,.5)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#ffd97a";ctx.font="bold 30px serif";
+  ctx.fillText("ポーズ",W/2,H/2);
+  ctx.fillStyle="#888";ctx.font="14px sans-serif";
+  ctx.fillText("P / Esc で再開",W/2,H/2+30);
+  // ---- 羽ばたく風 (賢者): ポーズから使用可 (T32) ----
+  if(G.screen==="dungeon"&&SAVE&&SAVE.job==="mage"&&DUNGEON&&DUNGEON.player){
+    const p=DUNGEON.player;
+    const y=H/2+78;
+    const ok=p.flySkillCd<=0&&p.mp>=22;
+    ctx.fillStyle=ok?"rgba(30,55,90,.9)":"rgba(28,26,24,.9)";
+    ctx.fillRect(W/2-250,y-26,500,56);
+    ctx.strokeStyle=ok?"#7ec8ff":"#555";ctx.lineWidth=2;ctx.strokeRect(W/2-250,y-26,500,56);
+    ctx.fillStyle=ok?"#bfe8ff":"#888";ctx.font="bold 17px sans-serif";
+    ctx.fillText("羽ばたく風  (MP 22)",W/2,y-4);
+    ctx.fillStyle="#9ab";ctx.font="12px sans-serif";
+    const sub=p.flyT>0?"現在: 残り"+p.flyT+"ターン飛行中":(p.flySkillCd>0?"調整中(あと"+p.flySkillCd+"ターン)":"水面を12ターン渡れる・毒/穴無効");
+    ctx.fillText(sub,W/2,y+16);
+    ctx.fillStyle="#888";ctx.font="13px sans-serif";
+    ctx.fillText("F で使う",W/2,y+34);
+    if(keyP("KeyF"))useFlightSkill();
+  }
+}
+// (T41) 中ボスの吹き出し(台詞+話者名、上端中央)
+function drawSpeechBubble(){
+  if(!UI.speech||UI.speech.t<=0){UI.speech=null;return;}
+  UI.speech.t-=1/60;
+  const sp=UI.speech;
+  const alpha=Math.min(1,UI.speech.t/0.5);
+  ctx.textAlign="center";
+  ctx.font="bold 13px sans-serif";
+  const sw=ctx.measureText(sp.speaker).width;
+  ctx.font="bold 15px sans-serif";
+  const lines=[];
+  let rest=sp.text;
+  while(rest.length>26){
+    let cut=26;
+    if(rest[cut-1]===" "||rest[cut-1]==="、"||rest[cut-1]==="。")cut--;
+    lines.push(rest.slice(0,cut));
+    rest=rest.slice(cut);
+  }
+  lines.push(rest);
+  const tw=Math.max(sw,Math.max.apply(null,lines.map(function(l){return ctx.measureText(l).width;})));
+  const bw=tw+56,bh=34+lines.length*20;
+  const bx=W/2-bw/2,by=64;
+  ctx.globalAlpha=alpha;
+  ctx.fillStyle="rgba(14,10,18,.88)";
+  ctx.fillRect(bx,by,bw,bh);
+  ctx.strokeStyle="#8a5a2a";ctx.lineWidth=2;
+  ctx.strokeRect(bx,by,bw,bh);
+  ctx.lineWidth=1;
+  // 話者名バッジ
+  ctx.fillStyle="#5a3a1a";
+  ctx.fillRect(W/2-sw/2-8,by-13,sw+16,20);
+  ctx.fillStyle="#ffd97a";ctx.font="bold 13px sans-serif";
+  ctx.fillText(sp.speaker,W/2,by+2);
+  ctx.fillStyle="#f2ead8";ctx.font="bold 15px sans-serif";
+  for(let i=0;i<lines.length;i++)ctx.fillText(lines[i],W/2,by+26+i*20);
+  ctx.globalAlpha=1;
+}
+function drawToast(){
+  if(UI.toastT>0&&UI.toastMsg){
+    UI.toastT-=1/60;
+    ctx.textAlign="center";
+    ctx.font="bold 15px sans-serif";
+    const w=ctx.measureText(UI.toastMsg).width+40;
+    ctx.fillStyle="rgba(12,10,8,.8)";
+    ctx.fillRect(W/2-w/2,H-72,w,30);
+    ctx.strokeStyle="#6a5a30";ctx.strokeRect(W/2-w/2,H-72,w,30);
+    ctx.fillStyle="#ffd97a";
+    ctx.fillText(UI.toastMsg,W/2,H-52);
+  }
+  if(UI.flashLv>0){
+    UI.flashLv-=1/60;
+    ctx.fillStyle="rgba(255,210,74,"+Math.max(0,UI.flashLv*0.25)+")";
+    ctx.fillRect(0,0,W,H);
+  }
+}
+function drawGameOver(){
+  imgCover("bg_title.png",0,0,W,H,"#0a0a14");
+  ctx.fillStyle="rgba(20,5,5,.75)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.fillStyle="#e04040";ctx.font="bold 44px serif";
+  ctx.fillText("倒れた…",W/2,170);
+  ctx.fillStyle="#e8d9a0";ctx.font="15px sans-serif";
+  ctx.fillText(UI.gameoverReason,W/2,215);
+  ctx.fillText("最深記録: "+SAVE.maxFloor+"F    所持金: "+SAVE.gold+"G",W/2,245);
+  ctx.fillStyle="#ffd24a";ctx.font="bold 18px sans-serif";
+  ctx.fillText("Z: 地上(町)に戻る",W/2,320);
+  if(key("KeyZ","Enter")&&!G._o1){
+    G._o1=true;
+    G.screen="town";
+    setupTown();
+    playBGM("bgm_town.ogg");
+    playVoice("voice_shop.ogg");
+  }
+  if(!key("KeyZ","Enter"))G._o1=false;
+}
+function drawClear(){
+  imgCover("bg_clear.png",0,0,W,H,"#1a1226");
+  ctx.fillStyle="rgba(20,14,4,.45)";ctx.fillRect(0,0,W,H);
+  ctx.textAlign="center";
+  ctx.shadowColor="#ffb020";ctx.shadowBlur=30;
+  ctx.fillStyle="#ffd97a";ctx.font="bold 46px serif";
+  ctx.fillText("伝説の唐揚げ、奪還!",W/2,150);
+  ctx.shadowBlur=0;
+  img("icon_karaage.png",W/2-45,180,90,90,"#e8942e");
+  ctx.fillStyle="#e8d9a0";ctx.font="16px sans-serif";
+  ctx.fillText("唐揚げ魔王を倒し、黄金の唐揚げを手にした。",W/2,310);
+  ctx.fillText("あなたの物語は、ここで完成だ。",W/2,340);
+  ctx.fillStyle="rgba(200,190,150,.8)";ctx.font="14px sans-serif";
+  ctx.fillText("最終: "+JOBS[SAVE.job].name+" Lv."+SAVE.lv,W/2,390);
+  ctx.fillStyle="#ffd24a";ctx.font="bold 18px sans-serif";
+  ctx.fillText("Z: 地上(町)に戻る   (クリア後も遊べる)",W/2,450);
+  if(key("KeyZ","Enter")&&!G._c1){
+    G._c1=true;
+    G.screen="town";
+    setupTown();
+    playBGM("bgm_town.ogg");
+  }
+  if(!key("KeyZ","Enter"))G._c1=false;
+}
+
+// ============================================================
+// モバイルタッチ操作 (仮想キー方式: K に合成して既存ロジックを流用)
+// ============================================================
+let IS_TOUCH=false;
+window.SUPCLICK=false;
+const JOY={bx:112,by:118,r:54,id:-1,kx:0,ky:0};
+function joySet(dx,dy){
+  const dz=13;
+  VK.w=dy<-dz?1:0;
+  VK.s=dy>dz?1:0;
+  VK.a=dx<-dz?1:0;
+  VK.d=dx>dz?1:0;
+  mergeVK();
+}
+function joyRelease(){
+  // (T50) ダンジョンではスティックは移動しない(方向転換のみ=joyMoveのリアルタイム向き)。
+  //        移動は左下PAD8 / WASD / 矢印キーが担当。町・メニューのVKリセットは従来どおり
+  JOY.id=-1;JOY.kx=0;JOY.ky=0;joySet(0,0);
+}
+// (T46) 右端基準(dx)で保持 → layoutTouchUI() が動的W(x=W-dx)へ展開
+const ABTN=[
+  {dx:86,y:H-88,r:42,k:"z",lb:"Z"},
+  {dx:186,y:H-60,r:29,k:"x",lb:"X"},
+  {dx:162,y:H-154,r:29,k:"c",lb:"C"},
+  {dx:60,y:H-186,r:27,k:"v",lb:"V"},
+  {dx:252,y:H-70,r:26,k:"wait",lb:"待"},
+  {dx:252,y:H-150,r:26,k:"bag",lb:"B"}
+];
+const PADMENU=[
+  {dx:146,y2:82,k:"up",lb:"▲"},
+  {dx:146,y2:174,k:"down",lb:"▼"},
+  {dx:192,y2:128,k:"left",lb:"◀"},
+  {dx:100,y2:128,k:"right",lb:"▶"}
+];
+function layoutTouchUI(){
+  for(const b of ABTN)b.x=W-b.dx;
+  for(const pd of PADMENU)pd.x2=W-pd.dx;
+}
+layoutTouchUI();
+// ダンジョン用8方向パッド (矢印はすべて同一の三角形を描画)
+const PAD8C={x:150,y:H-150};
+const PAD8=[
+  {x:0,y:-1,d:["w"]},
+  {x:1,y:0,d:["d"]},
+  {x:0,y:1,d:["s"]},
+  {x:-1,y:0,d:["a"]},
+  {x:1,y:-1,d:["w","d"]},
+  {x:1,y:1,d:["s","d"]},
+  {x:-1,y:1,d:["s","a"]},
+  {x:-1,y:-1,d:["w","a"]}
+];
+const PAD8POS=PAD8.map(function(p,i){
+  return {x:PAD8C.x+p.x*54,y:PAD8C.y+p.y*54,r:22,d:p.d,ang:Math.atan2(p.y,p.x),i:i};
+});
+function drawPadArrow(x,y,r,ang){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.rotate(ang);
+  ctx.fillStyle="rgba(255,255,255,.88)";
+  ctx.beginPath();
+  ctx.moveTo(r*0.7,0);
+  ctx.lineTo(-r*0.42,-r*0.5);
+  ctx.lineTo(-r*0.2,0);
+  ctx.lineTo(-r*0.42,r*0.5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+const TOUCH={btn:{},pad:{},pad8:{},ref:{}};
+function pad8Press(b){
+  for(const k of b.d){
+    TOUCH.ref[k]=(TOUCH.ref[k]||0)+1;
+    VK[k]=1;
+  }
+  mergeVK();
+}
+function pad8Release(b){
+  for(const k of b.d){
+    TOUCH.ref[k]=Math.max(0,(TOUCH.ref[k]||0)-1);
+    if(!TOUCH.ref[k])VK[k]=0;
+  }
+  mergeVK();
+}
+function canvasPos(cx,cy){
+  // (T48) 常に「rect取得→単純ストレッチ」の1パス。
+  // 根因: キャンバスのバッファ(W×H)は常にそのCSS rect全体へストレッチされる(レターボックスは#wrapの
+  //  flex中央寄せ=canvasの「外」)。そのため rect最新値 なら x=(cx-r.left)/r.width*W が常に正解で、
+  //  T47のcontainアスペクトガードは「レターボックスがrect内にある」という誤前提でyを圧縮し、
+  //  回転直後に「見えている位置より下をタップ」する症状を作っていた(報告の根因)。
+  //  getBoundingClientRectは毎回呼び直すのでタッチイベントごとに常に最新rectで写像する。
+  const r=cv.getBoundingClientRect();
+  return {x:(cx-r.left)/r.width*W,y:(cy-r.top)/r.height*H};
+}
+cv.addEventListener("touchstart",function(e){
+  e.preventDefault();
+  IS_TOUCH=true;
+  layoutTouchUI(); // (T46) 動的W(画面回転)に追従
+  const TOL=touchTol(); // (T47) 回転直後は+20%許容
+  for(const t of e.changedTouches){
+    const p=canvasPos(t.clientX,t.clientY);
+    mouse.x=t.clientX;mouse.y=t.clientY;
+    let used=false;
+    for(const b of ABTN){
+      if(TOUCH.btn[b.k]===undefined&&Math.hypot(p.x-b.x,p.y-b.y)<=b.r*TOL+10){
+        TOUCH.btn[b.k]=t.identifier;
+        if(b.k==="wait"){
+          // (T48) isWait=上り階段判定 (T49) 階段選択表示中は無効(ターン停止中)
+          if(G.screen==="dungeon"&&TURN.phase==="player"&&!UI.stairs)endPlayerTurn(true,true);
+        }else if(b.k==="bag"){
+          if(!UI.stairs&&(G.screen==="dungeon"||G.screen==="town"))toggleBag(); // (T49) 選択表示中は無効
+        }else{
+          VK[b.k]=1;mergeVK();
+        }
+        used=true;break;
+      }
+    }
+    if(used)continue;
+    if(G.screen!=="dungeon"){
+      for(const pd of PADMENU){
+        if(TOUCH.pad[pd.k]===undefined&&Math.hypot(p.x-pd.x2,p.y-pd.y2)<=34*TOL){
+          TOUCH.pad[pd.k]=t.identifier;
+          VK[pd.k]=1;mergeVK();
+          used=true;break;
+        }
+      }
+    }
+    if(used)continue;
+    if(G.screen==="dungeon"){
+      for(const pd of PAD8POS){
+        if(TOUCH.pad8[pd.i]===undefined&&Math.hypot(p.x-pd.x,p.y-pd.y)<=pd.r*TOL+10){
+          TOUCH.pad8[pd.i]=t.identifier;
+          pad8Press(pd);
+          used=true;break;
+        }
+      }
+    }
+    if(used)continue;
+    if(JOY.id===-1&&Math.hypot(p.x-JOY.bx,p.y-JOY.by)<=110*TOL){
+      JOY.id=t.identifier;
+      joyMove(p.x,p.y);
+      continue;
+    }
+    if(G.screen==="town"){
+      const hit=townShopAt(p.x,p.y);
+      if(hit){
+        TOWN.sel=TOWN.shops.indexOf(hit);
+        townActivate(hit);
+        window.SUPCLICK=true;
+      }
+    }
+  }
+},{passive:false});
+function joyMove(x,y){
+  let dx=x-JOY.bx,dy=y-JOY.by;
+  const d=Math.hypot(dx,dy);
+  if(d>JOY.r){dx=dx/d*JOY.r;dy=dy/d*JOY.r;}
+  JOY.kx=dx;JOY.ky=dy;
+  if(G.screen!=="dungeon"){
+    joySet(dx,dy); // 町・メニュー: 従来どおりVKでメニュー操作
+    return;
+  }
+  // (T50) ダンジョン: スティック=方向転換用。デッドゾーン(13px)超過でリアルタイムに
+  //        8方向facingを設定(無料・ターン消費なし・移動しない)
+  if(Math.hypot(dx,dy)>13&&DUNGEON&&TURN.phase==="player"&&!UI.bag&&!UI.gate&&!UI.stairs){
+    // (T56) 軸別デッドゾーン: 交差軸がタッチノイズ(<13px)ならゼロ化 →
+    //        純粋な上下左右入力が斜め方向にならない(sign()は非ゼロなら±1になるため径方向のみでは不十分)
+    const dz=13;
+    const sx=Math.abs(dx)>dz?Math.sign(dx):0;
+    const sy=Math.abs(dy)>dz?Math.sign(dy):0;
+    if(sx!==0||sy!==0)DUNGEON.player.dirIdx=dirIndex(sx,sy);
+  }
+}
+cv.addEventListener("touchmove",function(e){
+  e.preventDefault();
+  for(const t of e.changedTouches){
+    if(JOY.id===t.identifier){
+      const p=canvasPos(t.clientX,t.clientY);
+      joyMove(p.x,p.y);
+    }
+  }
+},{passive:false});
+function touchEnd(e){
+  for(const t of e.changedTouches){
+    if(JOY.id===t.identifier){joyRelease();continue;}
+    for(const k in TOUCH.btn){
+      if(TOUCH.btn[k]===t.identifier){
+        TOUCH.btn[k]=undefined;
+        if(k!=="wait"&&k!=="bag"){VK[k]=0;mergeVK();}
+      }
+    }
+    for(const k in TOUCH.pad){
+      if(TOUCH.pad[k]===t.identifier){TOUCH.pad[k]=undefined;VK[k]=0;mergeVK();}
+    }
+    for(const k in TOUCH.pad8){
+      if(TOUCH.pad8[k]===t.identifier){
+        TOUCH.pad8[k]=undefined;
+        const b=PAD8POS[+k];
+        if(b)pad8Release(b);
+      }
+    }
+  }
+}
+cv.addEventListener("touchend",touchEnd,{passive:false});
+cv.addEventListener("touchcancel",touchEnd,{passive:false});
+function drawTouchUI(){
+  if(!IS_TOUCH)return;
+  layoutTouchUI(); // (T46) 動的W(画面回転)に追従
+  const menu=G.screen!=="dungeon";
+  ctx.save();
+  const MENU_ANG={up:Math.PI*1.5,down:Math.PI*0.5,left:Math.PI,right:0};
+  if(menu){
+    for(const pd of PADMENU){
+      const on=!!VK[pd.k];
+      ctx.fillStyle=on?"rgba(255,210,74,.45)":"rgba(255,255,255,.10)";
+      ctx.beginPath();ctx.arc(pd.x2,pd.y2,26,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle="rgba(255,255,255,.35)";ctx.lineWidth=2;ctx.stroke();
+      drawPadArrow(pd.x2,pd.y2,16,MENU_ANG[pd.k]);
+    }
+  }else{
+    for(const pd of PAD8POS){
+      const on=pd.d.some(function(k){return !!VK[k];});
+      ctx.fillStyle=on?"rgba(255,210,74,.45)":"rgba(255,255,255,.10)";
+      ctx.beginPath();ctx.arc(pd.x,pd.y,pd.r,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle="rgba(255,255,255,.35)";ctx.lineWidth=2;ctx.stroke();
+      drawPadArrow(pd.x,pd.y,14,pd.ang);
+    }
+  }
+  for(const b of ABTN){
+    const on=!!VK[b.k];
+    ctx.fillStyle=on?"rgba(255,170,50,.5)":"rgba(255,255,255,.10)";
+    ctx.beginPath();ctx.arc(b.x,b.y,b.r,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle="rgba(255,255,255,.35)";ctx.lineWidth=2;ctx.stroke();
+    ctx.fillStyle="rgba(255,255,255,.9)";
+    ctx.font="bold "+(b.r>36?20:14)+"px sans-serif";
+    ctx.textAlign="center";ctx.textBaseline="middle";
+    ctx.fillText(b.lb,b.x,b.y+1);
+  }
+  const act=JOY.id!==-1;
+  ctx.fillStyle="rgba(255,255,255,.07)";
+  ctx.beginPath();ctx.arc(JOY.bx,JOY.by,JOY.r,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle="rgba(255,255,255,.25)";ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle=act?"rgba(255,210,74,.55)":"rgba(255,255,255,.18)";
+  ctx.beginPath();ctx.arc(JOY.bx+JOY.kx,JOY.by+JOY.ky,24,0,Math.PI*2);ctx.fill();
+  if(!menu){
+    // (T50) ダンジョンでは左上スティック=方向転換用(移動しない)
+    ctx.fillStyle="rgba(255,255,255,.55)";
+    ctx.font="11px sans-serif";
+    ctx.textAlign="center";ctx.textBaseline="middle";
+    ctx.fillText("転",JOY.bx,JOY.by-JOY.r-10);
+  }
+  ctx.restore();
+}
+
+// ============================================================
+// メインループ
+// ============================================================
+let lastT=0;
+function loop(ts){
+  // (T49) watchdog: フレームループ内の例外を握りつぶすと rAF チェーンが死んでターンが永久停止する
+  // (T46と同様の症状: 「移動が止まる」。例外はconsoleに残して次フレームへ復帰させる)
+  try{
+    const dt=Math.min(0.05,(ts-lastT)/1000||0.016);
+    lastT=ts;
+    FRAME_DT=dt;
+    mergeVK();
+    update(dt);
+    draw();
+    if(IS_TOUCH)drawTouchUI();
+  }catch(err){
+    try{console.error("[frame-watchdog] ループ例外を捕捉し復帰: "+(err&&err.stack||err));}catch(e2){}
+  }
+  syncKeys();
+  requestAnimationFrame(loop);
+}
+// (T44) 最初のユーザー操作でBGM再生を再試行(モバイルの自動再生ブロック対策)
+// キー操作は既存keydownハンドラ内でunlockAudio()を呼ぶ(上記参照)
+window.addEventListener("pointerdown",unlockAudio);
+window.addEventListener("touchstart",unlockAudio);
+function boot(){
+  const s=loadSave();
+  SAVE=s;
+  setupTown();
+  if(SAVE)UI.toast("セーブデータを読み込んだ");
+  playBGM("bgm_title.ogg");
+  requestAnimationFrame(loop);
+}
+boot();
+</script>
+</body>
+</html>
